@@ -10,8 +10,8 @@ from telegram.ext import Application, MessageHandler, CommandHandler, filters, C
 # ============================================================
 TELEGRAM_TOKEN = "7845527801:AAHJUK5k0rRObYhTB4pDdEjOwlEMp20ENYw
 "
-SHEETS_URL = "https://script.google.com/macros/s/AKfycbzz7PDcz4vxJAngO2mJBOgsmK6Kni28b5jcuxk9KKolyqRdj_h6nngMASu7GdspTTuLvw/exec"
-ANTHROPIC_API_KEY = "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"
+SHEETS_URL = "SHEETS_URL"
+ANTHROPIC_API_KEY = "ANTHROPIC_API_KEY"
 ALLOWED_GROUP_ID = None  # Verrà impostato automaticamente al primo messaggio del gruppo
 # ============================================================
 

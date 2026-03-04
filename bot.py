@@ -8,7 +8,7 @@ from telegram.ext import Application, MessageHandler, CommandHandler, filters, C
 # ============================================================
 # CONFIGURAZIONE — modifica questi valori
 # ============================================================
-TELEGRAM_TOKEN = "7845527801:AAHJUK5k0rRObYhTB4pDdEjOwlEMp20ENYw
+TELEGRAM_TOKEN = "TELEGRAM_TOKEN"
 "
 SHEETS_URL = "SHEETS_URL"
 ANTHROPIC_API_KEY = "ANTHROPIC_API_KEY"

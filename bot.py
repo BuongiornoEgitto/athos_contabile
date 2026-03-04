@@ -8,10 +8,9 @@ from telegram.ext import Application, MessageHandler, CommandHandler, filters, C
 # ============================================================
 # CONFIGURAZIONE — modifica questi valori
 # ============================================================
-TELEGRAM_TOKEN = "TELEGRAM_TOKEN"
-
-SHEETS_URL = "SHEETS_URL"
-ANTHROPIC_API_KEY = "ANTHROPIC_API_KEY"
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+SHEETS_URL = os.environ.get("SHEETS_URL")
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 ALLOWED_GROUP_ID = None  # Verrà impostato automaticamente al primo messaggio del gruppo
 # ============================================================
 

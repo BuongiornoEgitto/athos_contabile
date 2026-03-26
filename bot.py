@@ -119,8 +119,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
  
     sheet_data = get_sheet_data()
     nome = user.first_name or "collega"
-    response = await ask_claude(f"{nome} dice: {text}", sheet_data)
- 
+      response = await ask_claude(text, sheet_data) 
     if response.startswith("TRANSACTION:"):
         try:
             json_str = response.replace("TRANSACTION:", "").strip()

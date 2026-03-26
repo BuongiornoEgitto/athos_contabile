@@ -125,6 +125,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             json_str = response.replace("TRANSACTION:", "").strip()
             tx_data = json.loads(json_str)
+            tx_data["guida"] = (user.first_name or "")[:8]
             success = save_transaction(tx_data)
             if success:
                 tipo_emoji = "💚" if tx_data["tipo"] == "entrata" else "🔴"

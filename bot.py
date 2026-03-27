@@ -92,9 +92,17 @@ async def ask_claude(user_message: str, sheet_context: str) -> str:
             timeout=30
         )
         data = response.json()
+
+        # Controlla se l'API ha restituito un errore
+        if "error" in data:
+            error_msg = data["error"].get("message", "Errore sconosciuto")
+            print(f"ERRORE API ANTHROPIC: {error_msg}")
+            return f"❌ Errore API: {error_msg}"
+
         return data["content"][0]["text"]
     except Exception as e:
-        return f"Errore connessione AI: {e}"
+        print(f"ERRORE CONNESSIONE: {e}")
+        return f"❌ Errore connessione AI: {e}"
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):

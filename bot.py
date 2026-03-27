@@ -41,6 +41,7 @@ Se il messaggio non è chiaro, chiedi una breve conferma.
 Rispondi sempre in italiano.
 """
 
+
 def get_sheet_data():
     try:
         response = requests.get(SHEETS_URL, timeout=10)
@@ -53,18 +54,16 @@ def get_sheet_data():
             if any(row):
                 t = dict(zip(headers, row))
                 transactions.append(t)
-
         entrate = sum(float(t.get("importo", 0)) for t in transactions if t.get("tipo") == "entrata")
         uscite = sum(float(t.get("importo", 0)) for t in transactions if t.get("tipo") == "uscita")
-
         summary = f"TOTALE ENTRATE: €{entrate:.2f}\nTOTALE USCITE: €{uscite:.2f}\nPROFITTO NETTO: €{entrate-uscite:.2f}\n\n"
         summary += "ULTIME 10 TRANSAZIONI:\n"
         for t in transactions[-10:]:
             summary += f"- {t.get('data','')} | {t.get('guida','')} | {t.get('tipo','').upper()} | €{t.get('importo','')} | {t.get('descrizione','')}\n"
-
         return summary
     except Exception as e:
         return f"Errore lettura dati: {e}"
+
 
 def save_transaction(data: dict):
     try:
@@ -73,6 +72,7 @@ def save_transaction(data: dict):
         return response.text == "OK"
     except:
         return False
+
 
 async def ask_claude(user_message: str, sheet_context: str) -> str:
     try:
@@ -96,6 +96,7 @@ async def ask_claude(user_message: str, sheet_context: str) -> str:
     except Exception as e:
         return f"Errore connessione AI: {e}"
 
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global ALLOWED_GROUP_ID
 
@@ -111,6 +112,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     if not text:
+        return
+
+    # Ignora messaggi che sono solo tag di colleghi (@username)
+    if text.startswith("@"):
         return
 
     await context.bot.send_chat_action(chat_id=chat.id, action="typing")
@@ -142,6 +147,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(reply, parse_mode="Markdown")
 
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Ciao! Sono *Athos*, il vostro contabile AI!\n\n"
@@ -156,6 +162,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "📖 *Come usare Athos:*\n\n"
@@ -169,6 +176,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+
 def main():
     print("🚀 Athos Bot avviato...")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -176,6 +184,7 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()

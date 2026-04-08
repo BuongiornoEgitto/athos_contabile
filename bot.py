@@ -1,7 +1,8 @@
 import os
+import re
 import json
 import requests
-from datetime import datetime, time
+from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 
@@ -12,83 +13,83 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 ALLOWED_GROUP_ID = None
 # ============================================================
 
+
+def detect_currency(text):
+    """Rileva se l'importo e' in lire egiziane e separa il valore."""
+    le_pattern = re.compile(
+        r'(\d+(?:[.,]\d+)?)\s*(?:le|LE|L\.E\.|l\.e\.|lire(?:\s+egiziane)?|EGP|egp)\b',
+        re.IGNORECASE
+    )
+    match_le = le_pattern.search(text)
+    if match_le:
+        importo = float(match_le.group(1).replace(',', '.'))
+        testo_pulito = le_pattern.sub('', text, count=1).strip()
+        return importo, "le", testo_pulito
+
+    return None, "eur", text
+
+
 SYSTEM_PROMPT = """Sei Athos, un agente AI contabile specializzato per agenzie di viaggi ed escursioni.
 Sei preciso, professionale e cordiale. Rispondi SEMPRE in italiano e in modo conciso.
 
+IMPORTANTE SUL FORMATO IMPORTO:
+- Se nel messaggio c'e' un importo con LE, L.E., lire, EGP → metti l'importo nel campo "importo_le" e lascia "importo_eur" vuoto ("")
+- Se l'importo e' in euro (nessuna valuta specificata, o simbolo €) → metti l'importo nel campo "importo_eur" e lascia "importo_le" vuoto ("")
+- NON convertire mai. Registra il numero esatto che l'utente ha scritto.
+
 REGOLE PER I MESSAGGI:
-CONVERSIONE VALUTE:
-- Tasso fisso: 1 EUR = 52 LE (lire egiziane)
-- Se l'importo è in lire egiziane (LE, L.E., lire, lire egiziane, EGP), CONVERTI AUTOMATICAMENTE in euro dividendo per 52. Arrotonda a 2 decimali.
-- Se l'importo è in dollari ($, USD), CONVERTI AUTOMATICAMENTE in euro usando tasso 1 EUR = 1.08 USD.
-- NON chiedere conferma, NON chiedere il tasso di cambio. Converti e registra direttamente.
-- Nella descrizione aggiungi l'importo originale tra parentesi, es: "guida canyon (300 LE)"
-- Se non è specificata la valuta, l'importo è sempre in EURO.
-- Se il messaggio inizia con "+" è sempre un'ENTRATA
-- Se il messaggio inizia con "-" è sempre un'USCITA
-- Tutto il testo dopo il segno e la cifra va interamente in "descrizione"
+- Se il messaggio inizia con "+" e' sempre un'ENTRATA
+- Se il messaggio inizia con "-" e' sempre un'USCITA
+- Parole come "spesa", "out", "pagamento", "costo" indicano USCITA
+- Parole come "in", "incasso", "entrata", "pagato da" indicano ENTRATA
+- La descrizione contiene tutto il testo dopo il segno, la cifra e l'eventuale valuta
 - Esempi:
-  "+100 tizio commissioni motorata" → tipo: entrata, importo: 100, descrizione: "tizio commissioni motorata"
-  "-300 Giuseppe guida Vesuvio" → tipo: uscita, importo: 300, descrizione: "Giuseppe guida Vesuvio"
-  "+500 Mario" → tipo: entrata, importo: 500, descrizione: "Mario"
-  "-80 carburante pulmino" → tipo: uscita, importo: 80, descrizione: "carburante pulmino"
+  "+100 tizio commissioni" → tipo: entrata, importo_eur: 100, importo_le: "", descrizione: "tizio commissioni"
+  "-300 Giuseppe guida" → tipo: uscita, importo_eur: 300, importo_le: "", descrizione: "Giuseppe guida"
+  "-1000 LE guida canyon" → tipo: uscita, importo_eur: "", importo_le: 1000, descrizione: "guida canyon"
+  "spesa 500 lire sim card" → tipo: uscita, importo_eur: "", importo_le: 500, descrizione: "sim card"
+  "+200 EGP commissioni foto" → tipo: entrata, importo_eur: "", importo_le: 200, descrizione: "commissioni foto"
 
 1. REGISTRARE UNA TRANSAZIONE
 Quando l'utente vuole aggiungere entrata/uscita, rispondi SOLO con questo JSON (nient'altro prima o dopo):
-TRANSACTION:{"tipo":"entrata","importo":500,"descrizione":"tizio commissioni motorata"}
+TRANSACTION:{"tipo":"entrata","importo_eur":500,"importo_le":"","descrizione":"tizio commissioni"}
 
-Il campo "tipo" può essere solo "entrata" o "uscita".
-Il campo "importo" è sempre un numero senza simbolo €.
-Il campo "descrizione" contiene TUTTO il testo dopo la cifra.
+O per lire egiziane:
+TRANSACTION:{"tipo":"uscita","importo_eur":"","importo_le":1000,"descrizione":"guida canyon"}
 
 2. RISPONDERE A DOMANDE
 Analizza i dati del foglio e rispondi in modo chiaro con numeri precisi.
 Per i report usa emoji per rendere il messaggio leggibile su Telegram.
 
-Se il messaggio non è chiaro, chiedi una breve conferma.
+Se il messaggio non e' chiaro, chiedi una breve conferma.
 Rispondi sempre in italiano.
 """
 
 
-def get_sheet_rows():
-    response = requests.get(SHEETS_URL, timeout=10)
-    return response.json()
-
-
-def calculate_totals(rows):
-    if len(rows) <= 1:
-        return 0.0, 0.0, 0.0, 0, []
-
-    headers = rows[0]
-    transactions = []
-
-    for row in rows[1:]:
-        if any(row):
-            t = dict(zip(headers, row))
-            transactions.append(t)
-
-    entrate = sum(float(t.get("importo", 0) or 0) for t in transactions if t.get("tipo") == "entrata")
-    uscite = sum(float(t.get("importo", 0) or 0) for t in transactions if t.get("tipo") == "uscita")
-    profitto = entrate - uscite
-
-    return entrate, uscite, profitto, len(transactions), transactions
-
-
 def get_sheet_data():
     try:
-        rows = get_sheet_rows()
+        response = requests.get(SHEETS_URL, timeout=10)
+        rows = response.json()
         if len(rows) <= 1:
             return "Nessuna transazione ancora registrata."
-
-        entrate, uscite, profitto, _, transactions = calculate_totals(rows)
-
-        summary = f"TOTALE ENTRATE: €{entrate:.2f}\n"
-        summary += f"TOTALE USCITE: €{uscite:.2f}\n"
-        summary += f"PROFITTO NETTO: €{profitto:.2f}\n\n"
+        headers = rows[0]
+        transactions = []
+        for row in rows[1:]:
+            if any(row):
+                t = dict(zip(headers, row))
+                transactions.append(t)
+        entrate_eur = sum(float(t.get("importo_eur", 0) or 0) for t in transactions if t.get("tipo") == "entrata")
+        uscite_eur = sum(float(t.get("importo_eur", 0) or 0) for t in transactions if t.get("tipo") == "uscita")
+        entrate_le = sum(float(t.get("importo_le", 0) or 0) for t in transactions if t.get("tipo") == "entrata")
+        uscite_le = sum(float(t.get("importo_le", 0) or 0) for t in transactions if t.get("tipo") == "uscita")
+        summary = f"TOTALE ENTRATE: €{entrate_eur:.2f} + {entrate_le:.0f} LE\n"
+        summary += f"TOTALE USCITE: €{uscite_eur:.2f} + {uscite_le:.0f} LE\n\n"
         summary += "ULTIME 10 TRANSAZIONI:\n"
-
         for t in transactions[-10:]:
-            summary += f"- {t.get('data','')} | {t.get('guida','')} | {t.get('tipo','').upper()} | €{t.get('importo','')} | {t.get('descrizione','')}\n"
-
+            eur = t.get('importo_eur', '')
+            le = t.get('importo_le', '')
+            importo_str = f"€{eur}" if eur else f"{le} LE"
+            summary += f"- {t.get('data','')} | {t.get('guida','')} | {t.get('tipo','').upper()} | {importo_str} | {t.get('descrizione','')}\n"
         return summary
     except Exception as e:
         return f"Errore lettura dati: {e}"
@@ -99,31 +100,7 @@ def save_transaction(data: dict):
         data["data"] = datetime.now().strftime("%Y-%m-%d")
         response = requests.post(SHEETS_URL, json=data, timeout=10)
         return response.text == "OK"
-    except Exception as e:
-        print(f"Errore salvataggio transazione: {e}")
-        return False
-
-
-def save_summary():
-    try:
-        rows = get_sheet_rows()
-        entrate, uscite, profitto, num_transazioni, _ = calculate_totals(rows)
-
-        summary_data = {
-            "action": "riepilogo",
-            "data": datetime.now().strftime("%Y-%m-%d"),
-            "entrate": round(entrate, 2),
-            "uscite": round(uscite, 2),
-            "profitto": round(profitto, 2),
-            "num_transazioni": num_transazioni
-        }
-
-        response = requests.post(SHEETS_URL, json=summary_data, timeout=10)
-        print("POST RIEPILOGO:", response.text)
-        return response.text == "OK"
-
-    except Exception as e:
-        print(f"Errore salvataggio riepilogo: {e}")
+    except:
         return False
 
 
@@ -144,7 +121,6 @@ async def ask_claude(user_message: str, sheet_context: str) -> str:
             },
             timeout=30
         )
-
         data = response.json()
 
         if "error" in data:
@@ -156,17 +132,6 @@ async def ask_claude(user_message: str, sheet_context: str) -> str:
     except Exception as e:
         print(f"ERRORE CONNESSIONE: {e}")
         return f"❌ Errore connessione AI: {e}"
-
-
-async def daily_summary(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        success = save_summary()
-        if success:
-            print("Riepilogo giornaliero salvato")
-        else:
-            print("Errore: riepilogo giornaliero non salvato")
-    except Exception as e:
-        print(f"Errore riepilogo automatico: {e}")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -200,31 +165,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tx_data = json.loads(json_str)
             tx_data["guida"] = (user.first_name or "")[:8]
             success = save_transaction(tx_data)
-
             if success:
                 tipo_emoji = "💚" if tx_data["tipo"] == "entrata" else "🔴"
+                eur = tx_data.get('importo_eur', '')
+                le = tx_data.get('importo_le', '')
+                if eur and str(eur) != "":
+                    importo_str = f"€{eur}"
+                else:
+                    importo_str = f"{le} LE"
                 reply = (
                     f"{tipo_emoji} *Transazione registrata!*\n\n"
                     f"📝 {tx_data.get('descrizione', '')}\n"
-                    f"💶 €{tx_data.get('importo', '')}\n"
+                    f"💶 {importo_str}\n"
                     f"👤 {tx_data.get('guida', '')}\n"
                     f"📅 {datetime.now().strftime('%d/%m/%Y')}"
                 )
             else:
                 reply = "❌ Errore nel salvare la transazione. Riprova."
-
         except Exception as e:
             reply = f"❌ Errore nel processare la transazione: {e}"
-
-        else:
-        if "report" in text.lower() or "riepilogo" in text.lower():
-            success = save_summary()
-            if success:
-                reply = f"✅ Riepilogo del {datetime.now().strftime('%Y-%m-%d')} aggiornato nel foglio Google."
-            else:
-                reply = "❌ Non sono riuscito a salvare il riepilogo nel foglio Google."
-        else:
-            reply = response
+    else:
+        reply = response
 
     await update.message.reply_text(reply, parse_mode="Markdown")
 
@@ -233,12 +194,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Ciao! Sono *Athos*, il vostro contabile AI!\n\n"
         "✏️ *Come registrare:*\n"
-        "`+100 tizio commissioni motorata` → entrata\n"
-        "`-300 Giuseppe guida Vesuvio` → uscita\n\n"
-        "📊 *Report e analisi:*\n"
-        "• _'Report del mese'_\n"
-        "• _'Qual è il profitto totale?'_\n"
-        "• _'Quanto abbiamo speso?'_\n\n"
+        "`+100 tizio commissioni` → entrata in euro\n"
+        "`-300 Giuseppe guida` → uscita in euro\n"
+        "`-1000 LE guida canyon` → uscita in lire\n"
+        "`+500 EGP commissioni` → entrata in lire\n\n"
+        "📊 *Report:* scrivi 'report' o 'profitto'\n\n"
         "Sono pronto! ✅",
         parse_mode="Markdown"
     )
@@ -249,28 +209,20 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📖 *Come usare Athos:*\n\n"
         "➕ *Entrata:* `+importo descrizione`\n"
         "➖ *Uscita:* `-importo descrizione`\n\n"
-        "Esempi:\n"
-        "`+2000 famiglia Rossi pacchetto Sicilia`\n"
-        "`-450 hotel Taormina`\n"
-        "`-80 carburante pulmino`\n\n"
+        "💱 *Valute:*\n"
+        "• Euro (default): `+100 Mario`\n"
+        "• Lire egiziane: `-1000LE guida` o `-1000 lire guida`\n\n"
         "📊 *Report:* scrivi 'report', 'profitto', 'riepilogo'",
         parse_mode="Markdown"
     )
 
 
 def main():
-    print("🚀 VERSIONE NUOVA ATHOS SENZA JOB_QUEUE")
+    print("🚀 Athos Bot avviato...")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    app.job_queue.run_daily(
-        daily_summary,
-        time(hour=23, minute=30)
-    )
-
     app.run_polling()
 
 

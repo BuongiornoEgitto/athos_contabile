@@ -2,10 +2,9 @@ import os
 import re
 import json
 import requests
-from datetime import datetime, time
+from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
-import pytz
 
 # ============================================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -18,14 +17,13 @@ ALLOWED_GROUP_ID = None
 LE_TO_EUR = 52  # 1 EUR = 52 LE
 USD_TO_EUR = 1.08  # 1 EUR = 1.08 USD
 
-# Fuso orario Egitto
-TIMEZONE = pytz.timezone("Africa/Cairo")
-
 
 def convert_currency(text):
-    """Converte lire egiziane e dollari in euro direttamente nel testo."""
+    """Converte lire egiziane e dollari in euro direttamente nel testo.
+    Restituisce (testo_modificato, nota_conversione)"""
     nota = None
 
+    # Pattern per lire egiziane: "1000le", "1000 le", "1000 LE", "1000 L.E.", "1000 lire", "1000 EGP"
     le_pattern = re.compile(
         r'(\d+(?:[.,]\d+)?)\s*(?:le|LE|L\.E\.|l\.e\.|lire(?:\s+egiziane)?|EGP|egp)\b',
         re.IGNORECASE
@@ -38,6 +36,7 @@ def convert_currency(text):
         text = le_pattern.sub(str(importo_eur), text, count=1)
         return text, nota
 
+    # Pattern per dollari: "7$", "7 $", "7 USD", "$7"
     usd_pattern = re.compile(
         r'(\d+(?:[.,]\d+)?)\s*(?:\$|USD|usd)\b|\$\s*(\d+(?:[.,]\d+)?)',
         re.IGNORECASE
@@ -114,54 +113,11 @@ def get_sheet_data():
 
 def save_transaction(data: dict):
     try:
-        data["data"] = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
+        data["data"] = datetime.now().strftime("%Y-%m-%d")
         response = requests.post(SHEETS_URL, json=data, timeout=10)
         return response.text == "OK"
     except:
         return False
-
-
-async def riepilogo_giornaliero(context: ContextTypes.DEFAULT_TYPE):
-    """Calcola il riepilogo del giorno e lo scrive nel foglio Riepilogo."""
-    try:
-        oggi = datetime.now(TIMEZONE).strftime("%Y-%m-%d")
-        response = requests.get(SHEETS_URL, timeout=10)
-        rows = response.json()
-
-        if len(rows) <= 1:
-            print(f"Riepilogo {oggi}: nessuna transazione.")
-            return
-
-        headers = rows[0]
-        transazioni_oggi = []
-        for row in rows[1:]:
-            if any(row):
-                t = dict(zip(headers, row))
-                if t.get("data", "") == oggi:
-                    transazioni_oggi.append(t)
-
-        if not transazioni_oggi:
-            print(f"Riepilogo {oggi}: nessuna transazione oggi.")
-            return
-
-        entrate = sum(float(t.get("importo", 0)) for t in transazioni_oggi if t.get("tipo") == "entrata")
-        uscite = sum(float(t.get("importo", 0)) for t in transazioni_oggi if t.get("tipo") == "uscita")
-        profitto = entrate - uscite
-
-        riepilogo = {
-            "action": "riepilogo",
-            "data": oggi,
-            "entrate": round(entrate, 2),
-            "uscite": round(uscite, 2),
-            "profitto": round(profitto, 2),
-            "num_transazioni": len(transazioni_oggi)
-        }
-
-        result = requests.post(SHEETS_URL, json=riepilogo, timeout=10)
-        print(f"Riepilogo {oggi} salvato: entrate={entrate}, uscite={uscite}, profitto={profitto}, tx={len(transazioni_oggi)}, result={result.text}")
-
-    except Exception as e:
-        print(f"Errore riepilogo giornaliero: {e}")
 
 
 async def ask_claude(user_message: str, sheet_context: str) -> str:
@@ -183,6 +139,7 @@ async def ask_claude(user_message: str, sheet_context: str) -> str:
         )
         data = response.json()
 
+        # Controlla se l'API ha restituito un errore
         if "error" in data:
             error_msg = data["error"].get("message", "Errore sconosciuto")
             print(f"ERRORE API ANTHROPIC: {error_msg}")
@@ -211,13 +168,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
+    # Ignora messaggi che sono solo tag di colleghi (@username)
     if text.startswith("@"):
         return
 
     await context.bot.send_chat_action(chat_id=chat.id, action="typing")
 
+    # Converti valute PRIMA di mandare a Claude
     text_convertito, nota_conversione = convert_currency(text)
 
+    # Se c'è stata una conversione, aggiungi la nota al testo
     if nota_conversione:
         text_convertito = text_convertito.rstrip() + " " + nota_conversione
 
@@ -241,7 +201,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"💶 €{tx_data.get('importo', '')}"
                     f"{conversione_info}\n"
                     f"👤 {tx_data.get('guida', '')}\n"
-                    f"📅 {datetime.now(TIMEZONE).strftime('%d/%m/%Y')}"
+                    f"📅 {datetime.now().strftime('%d/%m/%Y')}"
                 )
             else:
                 reply = "❌ Errore nel salvare la transazione. Riprova."
@@ -265,7 +225,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• _'Report del mese'_\n"
         "• _'Qual è il profitto totale?'_\n"
         "• _'Quanto abbiamo speso?'_\n\n"
-        "📋 Riepilogo giornaliero automatico alle 23:00\n\n"
         "Sono pronto! ✅",
         parse_mode="Markdown"
     )
@@ -292,14 +251,6 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    # Riepilogo giornaliero alle 23:00 ora Egitto
-    app.job_queue.run_daily(
-        riepilogo_giornaliero,
-        time=time(hour=23, minute=0, tzinfo=TIMEZONE)
-    )
-    print("⏰ Riepilogo giornaliero programmato alle 23:00")
-
     app.run_polling()
 
 

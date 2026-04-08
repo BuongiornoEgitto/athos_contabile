@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import requests
 from datetime import datetime
@@ -12,25 +13,63 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 ALLOWED_GROUP_ID = None
 # ============================================================
 
+# Tassi di cambio fissi
+LE_TO_EUR = 52  # 1 EUR = 52 LE
+USD_TO_EUR = 1.08  # 1 EUR = 1.08 USD
+
+
+def convert_currency(text):
+    """Converte lire egiziane e dollari in euro direttamente nel testo.
+    Restituisce (testo_modificato, nota_conversione)"""
+    nota = None
+
+    # Pattern per lire egiziane: "1000le", "1000 le", "1000 LE", "1000 L.E.", "1000 lire", "1000 EGP"
+    le_pattern = re.compile(
+        r'(\d+(?:[.,]\d+)?)\s*(?:le|LE|L\.E\.|l\.e\.|lire(?:\s+egiziane)?|EGP|egp)\b',
+        re.IGNORECASE
+    )
+    match_le = le_pattern.search(text)
+    if match_le:
+        importo_le = float(match_le.group(1).replace(',', '.'))
+        importo_eur = round(importo_le / LE_TO_EUR, 2)
+        nota = f"({int(importo_le)} LE)"
+        text = le_pattern.sub(str(importo_eur), text, count=1)
+        return text, nota
+
+    # Pattern per dollari: "7$", "7 $", "7 USD", "$7"
+    usd_pattern = re.compile(
+        r'(\d+(?:[.,]\d+)?)\s*(?:\$|USD|usd)\b|\$\s*(\d+(?:[.,]\d+)?)',
+        re.IGNORECASE
+    )
+    match_usd = usd_pattern.search(text)
+    if match_usd:
+        importo_usd = float((match_usd.group(1) or match_usd.group(2)).replace(',', '.'))
+        importo_eur = round(importo_usd / USD_TO_EUR, 2)
+        nota = f"({int(importo_usd)} USD)"
+        text = usd_pattern.sub(str(importo_eur), text, count=1)
+        return text, nota
+
+    return text, nota
+
+
 SYSTEM_PROMPT = """Sei Athos, un agente AI contabile specializzato per agenzie di viaggi ed escursioni.
 Sei preciso, professionale e cordiale. Rispondi SEMPRE in italiano e in modo conciso.
 
+IMPORTANTE: Tutti gli importi che ricevi sono GIA' convertiti in EURO. Non fare nessuna conversione.
+Se nella descrizione vedi una nota tra parentesi come "(300 LE)" o "(7 USD)", lasciala nella descrizione.
+
 REGOLE PER I MESSAGGI:
-CONVERSIONE VALUTE:
-- Tasso fisso: 1 EUR = 52 LE (lire egiziane)
-- Se l'importo è in lire egiziane (LE, L.E., lire, lire egiziane, EGP), CONVERTI AUTOMATICAMENTE in euro dividendo per 52. Arrotonda a 2 decimali.
-- Se l'importo è in dollari ($, USD), CONVERTI AUTOMATICAMENTE in euro usando tasso 1 EUR = 1.08 USD.
-- NON chiedere conferma, NON chiedere il tasso di cambio. Converti e registra direttamente.
-- Nella descrizione aggiungi l'importo originale tra parentesi, es: "guida canyon (300 LE)"
-- Se non è specificata la valuta, l'importo è sempre in EURO.
 - Se il messaggio inizia con "+" è sempre un'ENTRATA
 - Se il messaggio inizia con "-" è sempre un'USCITA
+- Parole come "spesa", "out", "pagamento", "costo" indicano USCITA
+- Parole come "in", "incasso", "entrata", "pagato da" indicano ENTRATA
 - Tutto il testo dopo il segno e la cifra va interamente in "descrizione"
 - Esempi:
   "+100 tizio commissioni motorata" → tipo: entrata, importo: 100, descrizione: "tizio commissioni motorata"
   "-300 Giuseppe guida Vesuvio" → tipo: uscita, importo: 300, descrizione: "Giuseppe guida Vesuvio"
   "+500 Mario" → tipo: entrata, importo: 500, descrizione: "Mario"
   "-80 carburante pulmino" → tipo: uscita, importo: 80, descrizione: "carburante pulmino"
+  "spesa 5.77 guide (300 LE)" → tipo: uscita, importo: 5.77, descrizione: "guide (300 LE)"
 
 1. REGISTRARE UNA TRANSAZIONE
 Quando l'utente vuole aggiungere entrata/uscita, rispondi SOLO con questo JSON (nient'altro prima o dopo):
@@ -135,8 +174,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await context.bot.send_chat_action(chat_id=chat.id, action="typing")
 
+    # Converti valute PRIMA di mandare a Claude
+    text_convertito, nota_conversione = convert_currency(text)
+
+    # Se c'è stata una conversione, aggiungi la nota al testo
+    if nota_conversione:
+        text_convertito = text_convertito.rstrip() + " " + nota_conversione
+
     sheet_data = get_sheet_data()
-    response = await ask_claude(text, sheet_data)
+    response = await ask_claude(text_convertito, sheet_data)
 
     if response.startswith("TRANSACTION:"):
         try:
@@ -146,10 +192,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             success = save_transaction(tx_data)
             if success:
                 tipo_emoji = "💚" if tx_data["tipo"] == "entrata" else "🔴"
+                conversione_info = ""
+                if nota_conversione:
+                    conversione_info = f"\n🔄 Convertito da {nota_conversione}"
                 reply = (
                     f"{tipo_emoji} *Transazione registrata!*\n\n"
                     f"📝 {tx_data.get('descrizione', '')}\n"
-                    f"💶 €{tx_data.get('importo', '')}\n"
+                    f"💶 €{tx_data.get('importo', '')}"
+                    f"{conversione_info}\n"
                     f"👤 {tx_data.get('guida', '')}\n"
                     f"📅 {datetime.now().strftime('%d/%m/%Y')}"
                 )
@@ -169,6 +219,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✏️ *Come registrare:*\n"
         "`+100 tizio commissioni motorata` → entrata\n"
         "`-300 Giuseppe guida Vesuvio` → uscita\n\n"
+        "💱 *Valute:* scrivi in LE, EGP o $ e converto automaticamente!\n"
+        "`-1000LE guida canyon` → registra €19.23\n\n"
         "📊 *Report e analisi:*\n"
         "• _'Report del mese'_\n"
         "• _'Qual è il profitto totale?'_\n"
@@ -183,10 +235,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📖 *Come usare Athos:*\n\n"
         "➕ *Entrata:* `+importo descrizione`\n"
         "➖ *Uscita:* `-importo descrizione`\n\n"
-        "Esempi:\n"
-        "`+2000 famiglia Rossi pacchetto Sicilia`\n"
-        "`-450 hotel Taormina`\n"
-        "`-80 carburante pulmino`\n\n"
+        "💱 *Valute accettate:*\n"
+        "• Euro (default): `+100 Mario`\n"
+        "• Lire egiziane: `-1000LE guida` o `-1000 lire guida`\n"
+        "• Dollari: `-7$ kefie` o `-7 USD kefie`\n\n"
+        "Tasso: 1€ = 52 LE | 1€ = 1.08$\n\n"
         "📊 *Report:* scrivi 'report', 'profitto', 'riepilogo'",
         parse_mode="Markdown"
     )

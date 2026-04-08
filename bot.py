@@ -216,11 +216,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             reply = f"❌ Errore nel processare la transazione: {e}"
 
-    else:
-        reply = response
-
+        else:
         if "report" in text.lower() or "riepilogo" in text.lower():
-            save_summary()
+            success = save_summary()
+            if success:
+                reply = f"✅ Riepilogo del {datetime.now().strftime('%Y-%m-%d')} aggiornato nel foglio Google."
+            else:
+                reply = "❌ Non sono riuscito a salvare il riepilogo nel foglio Google."
+        else:
+            reply = response
 
     await update.message.reply_text(reply, parse_mode="Markdown")
 

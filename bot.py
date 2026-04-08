@@ -193,7 +193,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    print("🚀 Athos Bot avviato...")
+    print("🚀 VERSIONE NUOVA ATHOS SENZA JOB_QUEUE")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))

@@ -37,18 +37,39 @@ IMPORTANTE SUL FORMATO IMPORTO:
 - Se l'importo e' in euro (nessuna valuta specificata, o simbolo €) → metti l'importo nel campo "importo_eur" e lascia "importo_le" vuoto ("")
 - NON convertire mai. Registra il numero esatto che l'utente ha scritto.
 
+SYSTEM_PROMPT = """Sei Athos, un agente AI contabile specializzato per agenzie di viaggi ed escursioni.
+Sei preciso, professionale e cordiale. Rispondi SEMPRE in italiano e in modo conciso.
+
 REGOLE PER I MESSAGGI:
-- Se il messaggio inizia con "+" e' sempre un'ENTRATA
-- Se il messaggio inizia con "-" e' sempre un'USCITA
-- Parole come "spesa", "out", "pagamento", "costo" indicano USCITA
-- Parole come "in", "incasso", "entrata", "pagato da" indicano ENTRATA
-- La descrizione contiene tutto il testo dopo il segno, la cifra e l'eventuale valuta
-- Esempi:
-  "+100 tizio commissioni" → tipo: entrata, importo_eur: 100, importo_le: "", descrizione: "tizio commissioni"
-  "-300 Giuseppe guida" → tipo: uscita, importo_eur: 300, importo_le: "", descrizione: "Giuseppe guida"
-  "-1000 LE guida canyon" → tipo: uscita, importo_eur: "", importo_le: 1000, descrizione: "guida canyon"
-  "spesa 500 lire sim card" → tipo: uscita, importo_eur: "", importo_le: 500, descrizione: "sim card"
-  "+200 EGP commissioni foto" → tipo: entrata, importo_eur: "", importo_le: 200, descrizione: "commissioni foto"
+- Se il messaggio inizia con "+" è sempre un'ENTRATA
+- Se il messaggio inizia con "-" è sempre un'USCITA
+- Tutto il testo dopo il segno e la cifra va interamente in "descrizione"
+
+VALUTA:
+- Se NON è specificata nessuna valuta, l'importo è in EURO
+- Se trovi LE, L.E., EGP, lire, lire egiziane, l'importo è in LIRE EGIZIANE
+- NON convertire nulla
+- NON chiedere conferma
+- Se l'importo è in euro, compila "importo_eur"
+- Se l'importo è in lire egiziane, compila "importo_le"
+- L'altro campo deve restare vuoto
+
+Quando l'utente vuole aggiungere entrata/uscita, rispondi SOLO con questo JSON (nient'altro prima o dopo):
+
+TRANSACTION:{"tipo":"entrata","importo_eur":100,"importo_le":"","descrizione":"tizio commissioni motorata"}
+
+oppure
+
+TRANSACTION:{"tipo":"uscita","importo_eur":"","importo_le":300,"descrizione":"guida canyon 300 LE"}
+
+REGOLE JSON:
+- "tipo" può essere solo "entrata" o "uscita"
+- "importo_eur" contiene solo numeri oppure stringa vuota
+- "importo_le" contiene solo numeri oppure stringa vuota
+- "descrizione" contiene tutto il testo dopo la cifra
+
+Se il messaggio non è una registrazione ma una domanda, rispondi normalmente in italiano.
+"""
 
 1. REGISTRARE UNA TRANSAZIONE
 Quando l'utente vuole aggiungere entrata/uscita, rispondi SOLO con questo JSON (nient'altro prima o dopo):
@@ -160,26 +181,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     response = await ask_claude(text, sheet_data)
 
     if response.startswith("TRANSACTION:"):
-        try:
-            json_str = response.replace("TRANSACTION:", "").strip()
-            tx_data = json.loads(json_str)
-            tx_data["guida"] = (user.first_name or "")[:8]
-            success = save_transaction(tx_data)
-            if success:
-                tipo_emoji = "💚" if tx_data["tipo"] == "entrata" else "🔴"
-                eur = tx_data.get('importo_eur', '')
-                le = tx_data.get('importo_le', '')
-                if eur and str(eur) != "":
-                    importo_str = f"€{eur}"
-                else:
-                    importo_str = f"{le} LE"
-                reply = (
-                    f"{tipo_emoji} *Transazione registrata!*\n\n"
-                    f"📝 {tx_data.get('descrizione', '')}\n"
-                    f"💶 {importo_str}\n"
-                    f"👤 {tx_data.get('guida', '')}\n"
-                    f"📅 {datetime.now().strftime('%d/%m/%Y')}"
-                )
+    try:
+        json_str = response.replace("TRANSACTION:", "").strip()
+        tx_data = json.loads(json_str)
+        tx_data["guida"] = (user.first_name or "")[:8]
+
+        # normalizza campi
+        tx_data["importo_eur"] = tx_data.get("importo_eur", "")
+        tx_data["importo_le"] = tx_data.get("importo_le", "")
+
+        success = save_transaction(tx_data)
+
+        if success:
+            tipo_emoji = "💚" if tx_data["tipo"] == "entrata" else "🔴"
+
+            if tx_data.get("importo_eur", "") != "":
+                importo_txt = f"€{tx_data.get('importo_eur', '')}"
+            elif tx_data.get("importo_le", "") != "":
+                importo_txt = f"{tx_data.get('importo_le', '')} LE"
+            else:
+                importo_txt = "-"
+
+            reply = (
+                f"{tipo_emoji} *Transazione registrata!*\n\n"
+                f"📝 {tx_data.get('descrizione', '')}\n"
+                f"💰 {importo_txt}\n"
+                f"👤 {tx_data.get('guida', '')}\n"
+                f"📅 {datetime.now().strftime('%d/%m/%Y')}"
+            )
+        else:
+            reply = "❌ Errore nel salvare la transazione. Riprova."
+    except Exception as e:
+        reply = f"❌ Errore nel processare la transazione: {e}"
             else:
                 reply = "❌ Errore nel salvare la transazione. Riprova."
         except Exception as e:

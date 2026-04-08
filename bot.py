@@ -1,7 +1,7 @@
 import os
 import json
 import requests
-from datetime import datetime
+from datetime import datetime, time
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 
@@ -49,24 +49,46 @@ Rispondi sempre in italiano.
 """
 
 
+def get_sheet_rows():
+    response = requests.get(SHEETS_URL, timeout=10)
+    return response.json()
+
+
+def calculate_totals(rows):
+    if len(rows) <= 1:
+        return 0.0, 0.0, 0.0, 0, []
+
+    headers = rows[0]
+    transactions = []
+
+    for row in rows[1:]:
+        if any(row):
+            t = dict(zip(headers, row))
+            transactions.append(t)
+
+    entrate = sum(float(t.get("importo", 0) or 0) for t in transactions if t.get("tipo") == "entrata")
+    uscite = sum(float(t.get("importo", 0) or 0) for t in transactions if t.get("tipo") == "uscita")
+    profitto = entrate - uscite
+
+    return entrate, uscite, profitto, len(transactions), transactions
+
+
 def get_sheet_data():
     try:
-        response = requests.get(SHEETS_URL, timeout=10)
-        rows = response.json()
+        rows = get_sheet_rows()
         if len(rows) <= 1:
             return "Nessuna transazione ancora registrata."
-        headers = rows[0]
-        transactions = []
-        for row in rows[1:]:
-            if any(row):
-                t = dict(zip(headers, row))
-                transactions.append(t)
-        entrate = sum(float(t.get("importo", 0)) for t in transactions if t.get("tipo") == "entrata")
-        uscite = sum(float(t.get("importo", 0)) for t in transactions if t.get("tipo") == "uscita")
-        summary = f"TOTALE ENTRATE: €{entrate:.2f}\nTOTALE USCITE: €{uscite:.2f}\nPROFITTO NETTO: €{entrate-uscite:.2f}\n\n"
+
+        entrate, uscite, profitto, _, transactions = calculate_totals(rows)
+
+        summary = f"TOTALE ENTRATE: €{entrate:.2f}\n"
+        summary += f"TOTALE USCITE: €{uscite:.2f}\n"
+        summary += f"PROFITTO NETTO: €{profitto:.2f}\n\n"
         summary += "ULTIME 10 TRANSAZIONI:\n"
+
         for t in transactions[-10:]:
             summary += f"- {t.get('data','')} | {t.get('guida','')} | {t.get('tipo','').upper()} | €{t.get('importo','')} | {t.get('descrizione','')}\n"
+
         return summary
     except Exception as e:
         return f"Errore lettura dati: {e}"
@@ -77,7 +99,31 @@ def save_transaction(data: dict):
         data["data"] = datetime.now().strftime("%Y-%m-%d")
         response = requests.post(SHEETS_URL, json=data, timeout=10)
         return response.text == "OK"
-    except:
+    except Exception as e:
+        print(f"Errore salvataggio transazione: {e}")
+        return False
+
+
+def save_summary():
+    try:
+        rows = get_sheet_rows()
+        entrate, uscite, profitto, num_transazioni, _ = calculate_totals(rows)
+
+        summary_data = {
+            "action": "riepilogo",
+            "data": datetime.now().strftime("%Y-%m-%d"),
+            "entrate": round(entrate, 2),
+            "uscite": round(uscite, 2),
+            "profitto": round(profitto, 2),
+            "num_transazioni": num_transazioni
+        }
+
+        response = requests.post(SHEETS_URL, json=summary_data, timeout=10)
+        print("POST RIEPILOGO:", response.text)
+        return response.text == "OK"
+
+    except Exception as e:
+        print(f"Errore salvataggio riepilogo: {e}")
         return False
 
 
@@ -98,6 +144,7 @@ async def ask_claude(user_message: str, sheet_context: str) -> str:
             },
             timeout=30
         )
+
         data = response.json()
 
         if "error" in data:
@@ -109,6 +156,17 @@ async def ask_claude(user_message: str, sheet_context: str) -> str:
     except Exception as e:
         print(f"ERRORE CONNESSIONE: {e}")
         return f"❌ Errore connessione AI: {e}"
+
+
+async def daily_summary(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        success = save_summary()
+        if success:
+            print("Riepilogo giornaliero salvato")
+        else:
+            print("Errore: riepilogo giornaliero non salvato")
+    except Exception as e:
+        print(f"Errore riepilogo automatico: {e}")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -142,6 +200,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tx_data = json.loads(json_str)
             tx_data["guida"] = (user.first_name or "")[:8]
             success = save_transaction(tx_data)
+
             if success:
                 tipo_emoji = "💚" if tx_data["tipo"] == "entrata" else "🔴"
                 reply = (
@@ -153,10 +212,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             else:
                 reply = "❌ Errore nel salvare la transazione. Riprova."
+
         except Exception as e:
             reply = f"❌ Errore nel processare la transazione: {e}"
+
     else:
         reply = response
+
+        if "report" in text.lower() or "riepilogo" in text.lower():
+            save_summary()
 
     await update.message.reply_text(reply, parse_mode="Markdown")
 
@@ -193,9 +257,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     print("🚀 VERSIONE NUOVA ATHOS SENZA JOB_QUEUE")
     app = Application.builder().token(TELEGRAM_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    app.job_queue.run_daily(
+        daily_summary,
+        time(hour=23, minute=30)
+    )
+
     app.run_polling()
 
 

@@ -7,8 +7,9 @@ from telegram.ext import Application, MessageHandler, CommandHandler, filters, C
 
 # ============================================================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-SHEETS_URL = os.environ.get("SHEETS_URL")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 ALLOWED_GROUP_ID = None
 # ============================================================
 
@@ -42,12 +43,58 @@ Se il messaggio non e' una transazione, rispondi: "Scrivi nel formato +/- import
 """
 
 
-def save_transaction(data: dict):
+def save_transaction(data: dict) -> bool:
+    """Insert one transaction row into Supabase via the REST API.
+
+    Claude returns empty strings for the amount that doesn't apply
+    (importo_eur="" when LE is used, and vice versa). Supabase rejects
+    empty strings for numeric columns, so we convert them to None /
+    omit them from the payload.
+    """
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        print("ERRORE: SUPABASE_URL o SUPABASE_SERVICE_KEY mancanti")
+        return False
+
+    payload = {
+        "data": datetime.now().strftime("%Y-%m-%d"),
+        "guida": data.get("guida", ""),
+        "tipo": data.get("tipo"),
+        "descrizione": data.get("descrizione", ""),
+        "source": "telegram",
+    }
+
+    eur = data.get("importo_eur")
+    if eur not in (None, "", "null"):
+        try:
+            payload["importo_eur"] = float(eur)
+        except (TypeError, ValueError):
+            pass
+
+    le = data.get("importo_le")
+    if le not in (None, "", "null"):
+        try:
+            payload["importo_le"] = float(le)
+        except (TypeError, ValueError):
+            pass
+
     try:
-        data["data"] = datetime.now().strftime("%Y-%m-%d")
-        response = requests.post(SHEETS_URL, json=data, timeout=10)
-        return response.text == "OK"
-    except:
+        response = requests.post(
+            f"{SUPABASE_URL}/rest/v1/transactions",
+            headers={
+                "apikey": SUPABASE_SERVICE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            },
+            json=payload,
+            timeout=10,
+        )
+        if response.status_code in (200, 201, 204):
+            return True
+        print(f"ERRORE Supabase {response.status_code}: {response.text}")
+        return False
+    except Exception as e:
+        print(f"ERRORE save_transaction: {e}")
         return False
 
 

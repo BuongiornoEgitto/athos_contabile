@@ -10,6 +10,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
+SHEETS_URL = os.environ.get("SHEETS_URL")  # legacy Apps Script — kept for dual-write
 ALLOWED_GROUP_ID = None
 # ============================================================
 
@@ -43,18 +44,15 @@ Se il messaggio non e' una transazione, rispondi: "Scrivi nel formato +/- import
 """
 
 
-def save_transaction(data: dict) -> bool:
-    """Insert one transaction row into Supabase via the REST API.
-
-    Claude returns empty strings for the amount that doesn't apply
-    (importo_eur="" when LE is used, and vice versa). Supabase rejects
-    empty strings for numeric columns, so we convert them to None /
-    omit them from the payload.
-    """
+def _save_to_supabase(data: dict) -> bool:
+    """Insert one transaction row into Supabase via the REST API."""
     if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        print("ERRORE: SUPABASE_URL o SUPABASE_SERVICE_KEY mancanti")
+        print("SUPABASE: skipped (URL or KEY missing)")
         return False
 
+    # Claude returns empty strings for the amount that doesn't apply
+    # (importo_eur="" when LE is used, and vice versa). Supabase rejects
+    # empty strings for numeric columns, so drop them from the payload.
     payload = {
         "data": datetime.now().strftime("%Y-%m-%d"),
         "guida": data.get("guida", ""),
@@ -90,12 +88,44 @@ def save_transaction(data: dict) -> bool:
             timeout=10,
         )
         if response.status_code in (200, 201, 204):
+            print("SUPABASE: ✅ saved")
             return True
-        print(f"ERRORE Supabase {response.status_code}: {response.text}")
+        print(f"SUPABASE: ❌ {response.status_code} {response.text}")
         return False
     except Exception as e:
-        print(f"ERRORE save_transaction: {e}")
+        print(f"SUPABASE: ❌ {e}")
         return False
+
+
+def _save_to_sheets(data: dict) -> bool:
+    """Legacy — POST to the Apps Script endpoint that writes to Google Sheet.
+
+    Kept for dual-write during the transition. Remove SHEETS_URL env var
+    on Railway to disable.
+    """
+    if not SHEETS_URL:
+        return False
+    try:
+        payload = dict(data)
+        payload["data"] = datetime.now().strftime("%Y-%m-%d")
+        response = requests.post(SHEETS_URL, json=payload, timeout=10)
+        ok = response.text == "OK"
+        print(f"SHEETS: {'✅ saved' if ok else f'❌ {response.text[:80]}'}")
+        return ok
+    except Exception as e:
+        print(f"SHEETS: ❌ {e}")
+        return False
+
+
+def save_transaction(data: dict) -> bool:
+    """Dual-write: Supabase (primary) + Google Sheets (backup).
+
+    Returns True if at least one destination accepted the row, so the
+    team still gets confirmation even if one system is down.
+    """
+    supabase_ok = _save_to_supabase(data)
+    sheets_ok = _save_to_sheets(data)
+    return supabase_ok or sheets_ok
 
 
 async def ask_claude(user_message: str) -> str:

@@ -61,9 +61,17 @@ async def ask_claude(user_message: str) -> str:
                 "anthropic-version": "2023-06-01"
             },
             json={
-                "model": "claude-sonnet-4-20250514",
+                "model": "claude-sonnet-4-6",
                 "max_tokens": 200,
-                "system": SYSTEM_PROMPT,
+                # System prompt is stable across requests — cached so repeated
+                # messages don't re-bill the prompt tokens.
+                "system": [
+                    {
+                        "type": "text",
+                        "text": SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"}
+                    }
+                ],
                 "messages": [{"role": "user", "content": user_message}]
             },
             timeout=30
@@ -73,6 +81,15 @@ async def ask_claude(user_message: str) -> str:
         if "error" in data:
             error_msg = data["error"].get("message", "Errore sconosciuto")
             return f"❌ Errore API: {error_msg}"
+
+        # Log token usage (cache_read > 0 confirms caching is hitting)
+        usage = data.get("usage", {})
+        print(
+            f"tokens — input: {usage.get('input_tokens', 0)}, "
+            f"cache_read: {usage.get('cache_read_input_tokens', 0)}, "
+            f"cache_create: {usage.get('cache_creation_input_tokens', 0)}, "
+            f"output: {usage.get('output_tokens', 0)}"
+        )
 
         return data["content"][0]["text"]
     except Exception as e:

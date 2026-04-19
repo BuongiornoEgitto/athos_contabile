@@ -701,18 +701,71 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Role-aware intro message — users see only the commands relevant to them."""
     upsert_telegram_user(update.effective_user)
+    tg_user = get_telegram_user(update.effective_user.id)
+    role = (tg_user or {}).get("role")
+    display_name = (tg_user or {}).get("display_name") or "amico"
+
+    # --- Not yet mapped by Omar: show a minimal message ---
+    if not tg_user or not tg_user.get("account_code"):
+        await update.message.reply_text(
+            f"👋 Ciao {display_name}! Ti ho registrato nel sistema.\n\n"
+            "Omar deve ancora associarti a un conto. Quando te lo conferma "
+            "torna qui e scrivi /start per vedere i comandi che puoi usare.\n\n"
+            "🔎 /whoami — controlla il tuo stato"
+        )
+        return
+
+    # --- Contabile (Amr): only transfer slash commands ---
+    if role == "contabile":
+        await update.message.reply_text(
+            f"👔 Ciao {display_name}! Sei registrato come *contabile*.\n\n"
+            "*I tuoi comandi:*\n"
+            "`/raccolgo 200 saif` — ricevi soldi da una guida\n"
+            "`/verso 2000 omar` — consegni soldi alla proprieta\n"
+            "`/verso 500 banca` — versi in banca (quando attiva)\n\n"
+            "💡 Usa il nome della guida come appare in Telegram "
+            "(es: saif, abozeidm, maja).\n\n"
+            "🔎 /whoami — controlla il tuo stato",
+            parse_mode="Markdown",
+        )
+        return
+
+    # --- Guida: only the +/- syntax for economic events ---
+    if role == "guida":
+        await update.message.reply_text(
+            f"👋 Ciao {display_name}! Sei registrato come *guida*.\n\n"
+            "*Come registrare un evento:*\n"
+            "`+200 tour piramidi` → incasso in euro\n"
+            "`+500 EGP commissione` → incasso in lire egiziane\n"
+            "`-50 cammello` → spesa in euro\n"
+            "`-1000 LE biglietto museo` → spesa in lire\n\n"
+            "Quando passi i soldi ad Amr, lui scrive /raccolgo dalla sua parte "
+            "e i tuoi saldi si aggiornano da soli.\n\n"
+            "🔎 /whoami — controlla il tuo stato",
+            parse_mode="Markdown",
+        )
+        return
+
+    # --- Proprieta (Omar): can do both (logs economic events AND sees all) ---
+    if role == "proprieta":
+        await update.message.reply_text(
+            f"🏠 Ciao {display_name}! Sei registrato come *proprieta*.\n\n"
+            "*Registrare spese/incassi fatti da te:*\n"
+            "`+200 commissione hotel` → incasso\n"
+            "`-1000 LE pranzo beduino` → spesa in lire\n\n"
+            "*Comandi contabili* (se vuoi registrare movimenti manuali):\n"
+            "`/raccolgo <importo> <guida>`\n"
+            "`/verso <importo> <destinazione>`\n\n"
+            "🔎 /whoami — controlla il tuo stato",
+            parse_mode="Markdown",
+        )
+        return
+
+    # --- Unknown role (shouldn't happen): generic fallback ---
     await update.message.reply_text(
-        "👋 Ciao! Sono *Athos*, contabile AI di Buongiorno Egitto.\n\n"
-        "✏️ *Guide — registrare un evento:*\n"
-        "`+200 tour piramidi` → incasso\n"
-        "`-50 cammello` → spesa\n"
-        "`-1000 LE biglietto museo` → spesa in lire\n\n"
-        "👔 *Contabile — trasferimenti:*\n"
-        "`/raccolgo 200 saif` → ricevi da guida\n"
-        "`/verso 2000 omar` → consegni a proprieta\n\n"
-        "🔎 `/whoami` per vedere come ti vedo io.",
-        parse_mode="Markdown",
+        f"👋 Ciao {display_name}! Il tuo ruolo è '{role}' — contatta Omar per info."
     )
 
 

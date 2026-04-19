@@ -491,15 +491,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         importo_str = f"{le} LE"
 
+    # No parse_mode — account_code like "ricavi_tour" has an underscore
+    # that Markdown would interpret as italic markers → BadRequest.
     reply = (
-        f"{emoji} *Registrato nel giornale!*\n\n"
+        f"{emoji} Registrato nel giornale!\n\n"
         f"📝 {descrizione}\n"
         f"💶 {importo_str}\n"
         f"🏷️ {account_code}\n"
         f"👤 {tg_user.get('display_name', '')}\n"
         f"📅 {datetime.now().strftime('%d/%m/%Y')}"
     )
-    await update.message.reply_text(reply, parse_mode="Markdown")
+    await update.message.reply_text(reply)
 
 
 # ============================================================
@@ -583,10 +585,11 @@ async def cmd_raccolgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Errore nel registrare. Riprova.")
         return
 
+    # No parse_mode — literal "cassa_contabile" contains an underscore
+    # that breaks Markdown entity parsing.
     await update.message.reply_text(
-        f"✅ *Raccolto €{importo:.2f} da {guida['display_name']}*\n\n"
-        f"I soldi sono ora in cassa_contabile.",
-        parse_mode="Markdown",
+        f"✅ Raccolto €{importo:.2f} da {guida['display_name']}\n\n"
+        f"I soldi sono ora in cassa del contabile."
     )
 
 
@@ -629,10 +632,10 @@ async def cmd_verso(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     dest_account = dest_map.get(dest_raw)
     if not dest_account:
+        # No parse_mode — user input (dest_raw) could contain underscores.
         await update.message.reply_text(
             f"❌ Destinazione '{dest_raw}' non valida.\n"
-            f"Usa: `omar`, `proprieta`, o `banca`.",
-            parse_mode="Markdown",
+            f"Usa: omar, proprieta, o banca."
         )
         return
 
@@ -665,13 +668,15 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not tg_user:
         await update.message.reply_text("❌ Non ti trovo nel database.")
         return
+    # NOTE: no parse_mode — account codes and "user_id" contain underscores
+    # which Telegram's Markdown parser interprets as italic markers and fails
+    # with "Can't parse entities". Plain text is the safe choice here.
     await update.message.reply_text(
-        f"🆔 user_id: `{tg_user['telegram_user_id']}`\n"
+        f"🆔 ID utente: {tg_user['telegram_user_id']}\n"
         f"👤 nome: {tg_user.get('display_name') or '—'}\n"
         f"@username: {tg_user.get('username') or '—'}\n"
         f"🎭 ruolo: {tg_user.get('role') or '(non assegnato)'}\n"
-        f"🏷️ conto: {tg_user.get('account_code') or '(non assegnato)'}",
-        parse_mode="Markdown",
+        f"🏷️ conto: {tg_user.get('account_code') or '(non assegnato)'}"
     )
 
 

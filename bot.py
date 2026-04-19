@@ -401,7 +401,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif chat.id != ALLOWED_GROUP_ID:
             return
 
-    if not text or text.startswith("@"):
+    if not text:
+        return
+
+    # Ignore messages that are conversations between team members, not
+    # transactions intended for the bot. Two heuristics:
+    #   - Message starts with "@" (old guard, kept as belt-and-suspenders)
+    #   - Message contains any @mention or text-mention entity (Telegram
+    #     tells us explicitly when the user tagged someone)
+    # Replies to other users (not to the bot) are also treated as chatter.
+    if text.startswith("@"):
+        return
+
+    entities = update.message.entities or []
+    if any(e.type in ("mention", "text_mention") for e in entities):
+        return
+
+    # If this is a reply, only process it if it's a reply to the bot itself
+    # (e.g., someone correcting a previous bot message). Replies to other
+    # humans are chatter.
+    reply_to = update.message.reply_to_message
+    if reply_to and reply_to.from_user and not reply_to.from_user.is_bot:
         return
 
     # 1. Always register/refresh the sender

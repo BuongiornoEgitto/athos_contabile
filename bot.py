@@ -59,39 +59,53 @@ REGOLE TIPO:
 CONTO (account_code): scegli UNO di questi in base alla descrizione:
 
 RICAVI (quando tipo=entrata):
-- ricavi_tour → tour principali (piramidi, luxor, assuan, abu simbel, escursione di piu giorni)
-- ricavi_escursioni → escursioni brevi giornaliere (deserto, mare, quad, cammello)
-- ricavi_commissioni → commissioni da partner, hotel, negozi
-- ricavi_foto → servizi fotografici
-- ricavi_altri → tutto il resto dei ricavi
+- ricavi_escursioni → TUTTI gli incassi da clienti per tour ed escursioni
+  (piramidi, luxor, assuan, abu simbel, deserto, mare, quad, cammello, ecc.).
+  DEFAULT: usa questo anche quando la descrizione contiene solo nome cliente
+  e/o hotel senza specificare l'attività.
+- ricavi_commissioni → commissioni da partner, hotel, negozi (solo se la
+  descrizione contiene esplicitamente "commissione", "provvigione",
+  "commission" o simili).
 
 COSTI (quando tipo=uscita):
 - costi_ristoranti → pranzi, cene con clienti, ristoranti
-- costi_motorata → cammelli, barche, motoscafi, feluche, quad, motociclette
-- costi_ingressi → biglietti siti archeologici, musei, templi
-- costi_trasporti → benzina, taxi, voli interni, bus, treni
+- costi_escursioni_vari → TUTTE le spese sul momento durante un'escursione:
+  affitto moto/quad/barche/feluche/motoscafi, cammelli e altri animali,
+  MANCE a driver/barcaioli/cammellieri/motoristi, attrezzatura piccola
+  (snorkeling, pinne, maschere), acqua/snack per clienti durante il tour,
+  piccoli pagamenti al volo al tempio/sito (guide extra, custodi).
+- costi_ingressi → biglietti UFFICIALI siti archeologici, musei, templi
+- costi_trasporti → benzina, taxi, voli interni, bus, treni, transfer aeroporto
 - costi_alloggio → hotel, case, resort per clienti
 - costi_guide_esterne → guide occasionali NON del team fisso
 - costi_marketing → pubblicita, social, annunci
 - costi_telefono → SIM, ricariche, internet, roaming
 - costi_stipendi → compensi guide fisse del team
-- costi_commissioni → commissioni pagate a partner, agenti
 - costi_bancari → fee PayPal, Stripe, bonifici, cambio valuta
 - costi_amministrativi → commercialista, licenze, permessi
-- costi_ufficio → cancelleria, attrezzatura, computer
+- costi_ufficio → cancelleria, attrezzatura ufficio, computer
 - costi_altri → tutto il resto delle spese
+
+NOTA "commissione" — può essere sia entrata che uscita:
+- se tipo=entrata → ricavi_commissioni (es. guida vende foto e prende %)
+- se tipo=uscita → costi_escursioni_vari (mance/commissioni ai driver durante tour)
 
 REGOLE DESCRIZIONE:
 - Tutto il testo dopo segno/cifra/valuta va in "descrizione"
 
 ESEMPI:
-"+200 tour piramidi" → TRANSACTION:{"tipo":"entrata","importo_eur":200,"importo_le":"","descrizione":"tour piramidi","account_code":"ricavi_tour"}
+"+200 tour piramidi" → TRANSACTION:{"tipo":"entrata","importo_eur":200,"importo_le":"","descrizione":"tour piramidi","account_code":"ricavi_escursioni"}
 "+150 escursione deserto" → TRANSACTION:{"tipo":"entrata","importo_eur":150,"importo_le":"","descrizione":"escursione deserto","account_code":"ricavi_escursioni"}
+"+300 Mario Rossi Hotel Sunrise" → TRANSACTION:{"tipo":"entrata","importo_eur":300,"importo_le":"","descrizione":"Mario Rossi Hotel Sunrise","account_code":"ricavi_escursioni"}
 "-50 pranzo clienti" → TRANSACTION:{"tipo":"uscita","importo_eur":50,"importo_le":"","descrizione":"pranzo clienti","account_code":"costi_ristoranti"}
-"-300 cammello" → TRANSACTION:{"tipo":"uscita","importo_eur":300,"importo_le":"","descrizione":"cammello","account_code":"costi_motorata"}
+"-300 cammello" → TRANSACTION:{"tipo":"uscita","importo_eur":300,"importo_le":"","descrizione":"cammello","account_code":"costi_escursioni_vari"}
+"-50 mancia motorista" → TRANSACTION:{"tipo":"uscita","importo_eur":50,"importo_le":"","descrizione":"mancia motorista","account_code":"costi_escursioni_vari"}
+"-20 acqua clienti" → TRANSACTION:{"tipo":"uscita","importo_eur":20,"importo_le":"","descrizione":"acqua clienti","account_code":"costi_escursioni_vari"}
+"-100 LE snorkeling" → TRANSACTION:{"tipo":"uscita","importo_eur":"","importo_le":100,"descrizione":"snorkeling","account_code":"costi_escursioni_vari"}
 "-1000 LE guida canyon" → TRANSACTION:{"tipo":"uscita","importo_eur":"","importo_le":1000,"descrizione":"guida canyon","account_code":"costi_guide_esterne"}
 "-500 LE biglietto valle re" → TRANSACTION:{"tipo":"uscita","importo_eur":"","importo_le":500,"descrizione":"biglietto valle re","account_code":"costi_ingressi"}
-"+100 commissione hotel" → TRANSACTION:{"tipo":"entrata","importo_eur":100,"importo_le":"","descrizione":"commissione hotel","account_code":"ricavi_commissioni"}
+"+100 commissione foto" → TRANSACTION:{"tipo":"entrata","importo_eur":100,"importo_le":"","descrizione":"commissione foto","account_code":"ricavi_commissioni"}
+"-30 commissione driver" → TRANSACTION:{"tipo":"uscita","importo_eur":30,"importo_le":"","descrizione":"commissione driver","account_code":"costi_escursioni_vari"}
 
 Rispondi SOLO con il JSON nel formato:
 TRANSACTION:{"tipo":"...","importo_eur":...,"importo_le":"...","descrizione":"...","account_code":"..."}
@@ -464,8 +478,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     tipo = tx.get("tipo")
+    # Fallback se Claude non include account_code. Per i ricavi ora abbiamo
+    # solo 2 conti attivi (escursioni + commissioni) e la stragrande maggioranza
+    # degli incassi è per tour/escursioni, quindi ricavi_escursioni è il default.
     account_code = tx.get("account_code") or (
-        "ricavi_altri" if tipo == "entrata" else "costi_altri"
+        "ricavi_escursioni" if tipo == "entrata" else "costi_altri"
     )
     descrizione = tx.get("descrizione", "")
 

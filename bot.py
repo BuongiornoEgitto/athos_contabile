@@ -500,7 +500,10 @@ def _is_suspect(tx: dict) -> tuple[bool, str]:
       - account_code è il fallback (costi_altri/ricavi_escursioni) E descrizione
         cortissima o vuota — il classificatore probabilmente non ha capito
     """
-    if tx.get("needs_review") is True:
+    # Truthy check: Claude può restituire bool true OR string "true"/"True".
+    # `is True` era troppo stretto e ignorava la stringa.
+    nr = tx.get("needs_review")
+    if nr is True or (isinstance(nr, str) and nr.strip().lower() == "true"):
         return True, "Claude segnala incertezza"
 
     def _amt(v):
@@ -531,12 +534,21 @@ def _format_amount(tx: dict) -> str:
     sign = "+" if tipo == "entrata" else "-"
     eur = tx.get("importo_eur")
     le = tx.get("importo_le")
-    if eur not in (None, "", "null"):
+    # Tratto 0 come "non specificato" così cade sull'altra valuta — evita "+0 EUR"
+    # quando in realtà l'importo è in LE.
+    def _has_amt(v):
+        if v in (None, "", "null"):
+            return False
+        try:
+            return float(v) > 0
+        except (TypeError, ValueError):
+            return False
+    if _has_amt(eur):
         try:
             return f"{sign}{int(float(eur))} EUR"
         except (TypeError, ValueError):
             return f"{sign}{eur} EUR"
-    if le not in (None, "", "null"):
+    if _has_amt(le):
         try:
             return f"{sign}{int(float(le))} LE"
         except (TypeError, ValueError):
@@ -653,6 +665,7 @@ def _parse_confirmation(text: str, n_transactions: int) -> tuple[str, list[int] 
         return "none", None
 
     # "solo 1,3" / "solo 1, 3" / "1,3" / "1 3" / "solo 2"
+    had_solo_prefix = bool(re.match(r"^solo\s+", t))
     cleaned = re.sub(r"^solo\s+", "", t)
     # Accetta separatori virgola/spazio
     parts = re.split(r"[,\s]+", cleaned.strip())
@@ -661,6 +674,12 @@ def _parse_confirmation(text: str, n_transactions: int) -> tuple[str, list[int] 
         nums = sorted({int(p) for p in parts})
         # Validità: tutti gli indici devono essere in [1..n]
         if nums and all(1 <= n <= n_transactions for n in nums):
+            # Anti-typo: un singolo numero senza "solo" potrebbe essere un
+            # errore di battitura. Richiedo "solo N" esplicito quando c'è
+            # solo un numero. Per "1,3" o più resta accettato com'è (chiaro
+            # che è una scelta esplicita).
+            if len(nums) == 1 and not had_solo_prefix and n_transactions > 1:
+                return "unknown", None
             return "subset", [n - 1 for n in nums]
     return "unknown", None
 
@@ -742,6 +761,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 4. Pending preview? Se sì, gestiamo conferma/annullo/subset PRIMA di
     # qualsiasi altra logica. Anche un timeout viene gestito qui.
+    # `replaced_pending` resta True se l'utente ha "abbandonato" il vecchio
+    # preview mandando una nuova transazione invece di rispondere — così il
+    # nuovo preview multi può prefissare un avviso.
+    replaced_pending = False
     pending = _pending_previews.get(user.id)
     if pending:
         age = datetime.utcnow() - pending["created_at"]
@@ -756,40 +779,52 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Preview ancora valida → tenta di interpretare come risposta
         action, indices = _parse_confirmation(text, len(pending["transactions"]))
         if action == "unknown":
-            await update.message.reply_text(
-                _confirmation_help_text(len(pending["transactions"]))
-            )
-            return
-        if action == "none":
+            # Sblocco anti-lockout: se il messaggio "non risposta" sembra
+            # invece una NUOVA transazione (almeno un token shape-tx), buttiamo
+            # via il vecchio preview e processiamo il nuovo messaggio. Così
+            # l'utente non resta intrappolato finché non scrive "no".
+            if _count_transaction_starts(text) >= 1:
+                _pending_previews.pop(user.id, None)
+                replaced_pending = True
+                # Fall through al codice normale sotto (single o multi path)
+            else:
+                await update.message.reply_text(
+                    _confirmation_help_text(len(pending["transactions"]))
+                )
+                return
+        elif action == "none":
             _pending_previews.pop(user.id, None)
             await update.message.reply_text("🚫 Annullato. Niente registrato.")
             return
-        # all / subset → scrivi le selezionate
-        selected = (
-            pending["transactions"]
-            if action == "all"
-            else [pending["transactions"][i] for i in indices]
-        )
-        _pending_previews.pop(user.id, None)
-        await context.bot.send_chat_action(chat_id=chat.id, action="typing")
-        results = []
-        for tx in selected:
-            entry_id, descr = _write_one_transaction(
-                tx,
-                cassa_account=pending["cassa_account"],
-                telegram_user_id=user.id,
-                user_first_name=user.first_name or "",
+        elif action in ("all", "subset"):
+            # all / subset → scrivi le selezionate
+            selected = (
+                pending["transactions"]
+                if action == "all"
+                else [pending["transactions"][i] for i in indices]
             )
-            mark = "✅" if entry_id else "❌"
-            results.append(f"{mark} {_format_amount(tx)} {descr or '(senza descr)'}")
-        n_ok = sum(1 for r in results if r.startswith("✅"))
-        header = (
-            f"💾 Registrate {n_ok}/{len(selected)} transazioni:\n\n"
-            if len(selected) > 1
-            else ""
-        )
-        await update.message.reply_text(header + "\n".join(results))
-        return
+            _pending_previews.pop(user.id, None)
+            await context.bot.send_chat_action(chat_id=chat.id, action="typing")
+            results = []
+            for tx in selected:
+                entry_id, descr = _write_one_transaction(
+                    tx,
+                    cassa_account=pending["cassa_account"],
+                    telegram_user_id=user.id,
+                    user_first_name=user.first_name or "",
+                )
+                mark = "✅" if entry_id else "❌"
+                results.append(f"{mark} {_format_amount(tx)} {descr or '(senza descr)'}")
+            n_ok = sum(1 for r in results if r.startswith("✅"))
+            header = (
+                f"💾 Registrate {n_ok}/{len(selected)} transazioni:\n\n"
+                if len(selected) > 1
+                else ""
+            )
+            await update.message.reply_text(header + "\n".join(results))
+            return
+        # action == "unknown" + tx-shape → fall through al codice sotto
+        # (replaced_pending è True, pending è già stato pop dal dict)
 
     # 5. Guide / proprieta: detect multi-transaction PRIMA di chiamare Claude
     await context.bot.send_chat_action(chat_id=chat.id, action="typing")
@@ -805,12 +840,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if tx is None:
                 # Una sotto-transazione non parsata → segnaliamo e continuiamo
                 # mettendola comunque in coda con flag suspect.
+                # Il fallback per "tipo" guarda sia il segno che le keyword
+                # (entrata/incasso → entrata, altrimenti → uscita).
+                piece_lower = piece.lstrip().lower()
+                if re.match(r"^(\+|entrata|incasso|in\s)", piece_lower):
+                    fallback_tipo = "entrata"
+                else:
+                    fallback_tipo = "uscita"
                 transactions.append({
-                    "tipo": "entrata" if piece.lstrip().startswith("+") else "uscita",
+                    "tipo": fallback_tipo,
                     "importo_eur": "",
                     "importo_le": "",
                     "descrizione": piece[:60],
-                    "account_code": "costi_altri",
+                    "account_code": "costi_altri" if fallback_tipo == "uscita" else "ricavi_escursioni",
                     "needs_review": True,
                 })
             else:
@@ -822,16 +864,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Sostituisci eventuale preview pendente (già rimosso sopra in caso di
-        # timeout; qui copriamo il caso "utente lascia preview e ne crea altra")
-        warn_replaced = user.id in _pending_previews
+        # Sostituisci eventuale preview pendente. `replaced_pending` è True se
+        # l'utente ci è arrivato dal blocco pending (ha "abbandonato" il vecchio
+        # preview mandando direttamente una nuova transazione).
         _pending_previews[user.id] = {
             "transactions": transactions,
             "created_at": datetime.utcnow(),
             "cassa_account": tg_user["account_code"],
         }
         preview = _format_preview(transactions)
-        if warn_replaced:
+        if replaced_pending:
             preview = (
                 "⚠️ Ho sostituito il preview precedente.\n\n" + preview
             )
@@ -858,7 +900,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "created_at": datetime.utcnow(),
             "cassa_account": tg_user["account_code"],
         }
-        await update.message.reply_text(_format_preview([tx]))
+        preview = _format_preview([tx])
+        if replaced_pending:
+            preview = "⚠️ Ho sostituito il preview precedente.\n\n" + preview
+        await update.message.reply_text(preview)
         return
 
     # Path "veloce" originale: scrivi subito

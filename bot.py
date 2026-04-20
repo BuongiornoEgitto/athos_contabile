@@ -15,9 +15,10 @@ Flow:
     (they land on the `proprieta` cash account instead of a guide's cassa)
 """
 import os
+import re
 import json
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -36,6 +37,21 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 SHEETS_URL = os.environ.get("SHEETS_URL")  # legacy — dual-write backup
 ALLOWED_GROUP_ID = None
+
+# ============================================================
+# Multi-transaction preview state
+# ============================================================
+# Pending previews keyed by telegram_user_id. Solo UNA preview attiva per
+# utente alla volta — se ne arriva una nuova, la vecchia viene sostituita.
+# Ogni voce contiene: transactions (list[dict]), created_at (datetime),
+# cassa_account (str catturato al momento della preview).
+_pending_previews: dict[int, dict] = {}
+PREVIEW_TIMEOUT_MIN = 5
+
+# Soglie "sospetto" per l'anteprima
+SUSPECT_EUR_THRESHOLD = 1900
+SUSPECT_LE_THRESHOLD = 60_000
+FALLBACK_ACCOUNTS = {"costi_altri", "ricavi_escursioni"}
 
 # ============================================================
 # Claude system prompt — now includes the chart of accounts so
@@ -106,9 +122,15 @@ ESEMPI:
 "-500 LE biglietto valle re" → TRANSACTION:{"tipo":"uscita","importo_eur":"","importo_le":500,"descrizione":"biglietto valle re","account_code":"costi_ingressi"}
 "+100 commissione foto" → TRANSACTION:{"tipo":"entrata","importo_eur":100,"importo_le":"","descrizione":"commissione foto","account_code":"ricavi_commissioni"}
 "-30 commissione driver" → TRANSACTION:{"tipo":"uscita","importo_eur":30,"importo_le":"","descrizione":"commissione driver","account_code":"costi_escursioni_vari"}
+"entrata 100 commissione foto" → TRANSACTION:{"tipo":"entrata","importo_eur":100,"importo_le":"","descrizione":"commissione foto","account_code":"ricavi_commissioni"}
+"uscita 30 acqua clienti" → TRANSACTION:{"tipo":"uscita","importo_eur":30,"importo_le":"","descrizione":"acqua clienti","account_code":"costi_escursioni_vari"}
 
 Rispondi SOLO con il JSON nel formato:
 TRANSACTION:{"tipo":"...","importo_eur":...,"importo_le":"...","descrizione":"...","account_code":"..."}
+
+CAMPO OPZIONALE "needs_review" (bool): aggiungilo a true SOLO se sei incerto
+sulla classificazione (descrizione ambigua, parola sconosciuta, ecc.).
+Esempio: "+90 Davide domina" → TRANSACTION:{"tipo":"entrata","importo_eur":90,"importo_le":"","descrizione":"Davide domina","account_code":"ricavi_escursioni","needs_review":true}
 
 Se il messaggio non e' una transazione, rispondi: "Scrivi nel formato +/- importo descrizione"
 """
@@ -399,6 +421,261 @@ def _build_economic_lines(
 
 
 # ============================================================
+# Multi-transaction parsing & preview helpers
+# ============================================================
+# Token che marca l'inizio di una transazione: +/- seguiti da numero, oppure
+# parole chiave (entrata/uscita/incasso/spesa) seguite — anche con altre
+# parole in mezzo — da un numero. Usato sia per il conteggio (detection) sia
+# per lo split. Case-insensitive.
+_KEYWORD_TOKENS = r"entrata|uscita|incasso|spesa"
+# Per la detection accettiamo tokens "ragionevoli": +/- attaccati a un numero,
+# oppure una keyword che precede un numero entro pochi caratteri.
+_DETECT_PATTERN = re.compile(
+    rf"""(?ix)
+        (?:^|\s)
+        (?:
+            [+\-]\s*\d                          # +200 / - 50
+            |
+            (?:{_KEYWORD_TOKENS})\b [^\n+\-]{{0,30}}? \d   # entrata 100 ...
+        )
+    """,
+)
+# Per lo split troviamo le posizioni di inizio di ogni transazione e ritagliamo
+# fra una posizione e la successiva.
+_SPLIT_PATTERN = re.compile(
+    rf"""(?ix)
+        (?:^|(?<=\s))
+        (?:
+            [+\-]\s*\d
+            |
+            (?:{_KEYWORD_TOKENS})\b [^\n+\-]{{0,30}}? \d
+        )
+    """,
+)
+
+
+def _count_transaction_starts(text: str) -> int:
+    """Conta quanti 'inizi di transazione' ci sono nel messaggio."""
+    return len(_DETECT_PATTERN.findall(text or ""))
+
+
+def _split_transactions(text: str) -> list[str]:
+    """Spezza il messaggio in N pezzi, uno per transazione.
+
+    Trova ogni 'inizio' (segno+numero o keyword+numero) e ritaglia fra una
+    occorrenza e la successiva. Se non trova nulla, restituisce l'intero testo
+    come singolo pezzo (così il chiamante può comunque inoltrarlo a Claude).
+    """
+    if not text:
+        return []
+    starts = [m.start() for m in _SPLIT_PATTERN.finditer(text)]
+    if not starts:
+        return [text.strip()]
+    pieces = []
+    for i, start in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(text)
+        chunk = text[start:end].strip()
+        if chunk:
+            pieces.append(chunk)
+    return pieces
+
+
+def _parse_claude_transaction(response: str) -> dict | None:
+    """Estrae il dict da una risposta Claude TRANSACTION:{...}. None se invalida."""
+    if not response or not response.startswith("TRANSACTION:"):
+        return None
+    try:
+        return json.loads(response.replace("TRANSACTION:", "").strip())
+    except Exception as e:
+        print(f"parse_claude_transaction error: {e} -- raw: {response[:200]}")
+        return None
+
+
+def _is_suspect(tx: dict) -> tuple[bool, str]:
+    """Heuristic: è una transazione 'sospetta'? Restituisce (bool, motivo).
+
+    Triggers:
+      - Claude ha messo needs_review=true
+      - importo > soglia (1900 EUR o 60000 LE)
+      - account_code è il fallback (costi_altri/ricavi_escursioni) E descrizione
+        cortissima o vuota — il classificatore probabilmente non ha capito
+    """
+    if tx.get("needs_review") is True:
+        return True, "Claude segnala incertezza"
+
+    def _amt(v):
+        try:
+            return float(v) if v not in (None, "", "null") else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    eur = _amt(tx.get("importo_eur"))
+    le = _amt(tx.get("importo_le"))
+    if eur > SUSPECT_EUR_THRESHOLD:
+        return True, f"importo elevato (€{eur:.0f})"
+    if le > SUSPECT_LE_THRESHOLD:
+        return True, f"importo elevato ({le:.0f} LE)"
+
+    descrizione = (tx.get("descrizione") or "").strip()
+    account_code = tx.get("account_code") or ""
+    if account_code in FALLBACK_ACCOUNTS and len(descrizione) < 4:
+        snippet = descrizione if descrizione else "(vuota)"
+        return True, f'"{snippet}" poco chiaro'
+
+    return False, ""
+
+
+def _format_amount(tx: dict) -> str:
+    """Formatta l'importo in stile '+90 EUR' / '-1000 LE'."""
+    tipo = tx.get("tipo")
+    sign = "+" if tipo == "entrata" else "-"
+    eur = tx.get("importo_eur")
+    le = tx.get("importo_le")
+    if eur not in (None, "", "null"):
+        try:
+            return f"{sign}{int(float(eur))} EUR"
+        except (TypeError, ValueError):
+            return f"{sign}{eur} EUR"
+    if le not in (None, "", "null"):
+        try:
+            return f"{sign}{int(float(le))} LE"
+        except (TypeError, ValueError):
+            return f"{sign}{le} LE"
+    return f"{sign}? "
+
+
+def _format_preview(transactions: list[dict]) -> str:
+    """Costruisce il messaggio di anteprima multi-transazione (plain text)."""
+    n = len(transactions)
+    lines = [f"📝 Ho trovato {n} transazion{'i' if n != 1 else 'e'}. Registro?", ""]
+    for i, tx in enumerate(transactions, start=1):
+        suspect, reason = _is_suspect(tx)
+        flag = "⚠️" if suspect else "✅"
+        amount = _format_amount(tx)
+        descr = (tx.get("descrizione") or "").strip() or "(senza descrizione)"
+        account = tx.get("account_code") or "?"
+        # Padding leggero per leggibilità — non rigido, Telegram usa font proporzionale
+        lines.append(f"{i}. {flag}  {amount}  {descr}  → {account}")
+        if suspect and reason:
+            lines.append(f"     ↑ {reason}")
+    lines.append("")
+    lines.append("Rispondi:")
+    lines.append('• "ok" → registro tutte')
+    lines.append('• "no" → annullo')
+    lines.append('• "solo 1,2,3" → registro solo quelle (numeri separati da virgola)')
+    return "\n".join(lines)
+
+
+def _write_one_transaction(
+    tx: dict,
+    cassa_account: str,
+    telegram_user_id: int,
+    user_first_name: str,
+) -> tuple[str | None, str]:
+    """Scrive una singola transazione: ritorna (entry_id|None, descrizione)."""
+    tipo = tx.get("tipo")
+    account_code = tx.get("account_code") or (
+        "ricavi_escursioni" if tipo == "entrata" else "costi_altri"
+    )
+    descrizione = tx.get("descrizione", "")
+
+    lines = _build_economic_lines(
+        tipo=tipo,
+        cassa_account=cassa_account,
+        economic_account=account_code,
+        importo_eur=tx.get("importo_eur"),
+        importo_le=tx.get("importo_le"),
+    )
+    if not lines:
+        return None, descrizione
+
+    entry_id = insert_journal_entry(
+        description=descrizione,
+        source="telegram",
+        telegram_user_id=telegram_user_id,
+        lines=lines,
+    )
+    if entry_id:
+        # Mirror to Sheets — stesso payload del flusso single
+        _save_to_sheets({
+            "guida": (user_first_name or "")[:8],
+            "tipo": tipo,
+            "importo_eur": tx.get("importo_eur", ""),
+            "importo_le": tx.get("importo_le", ""),
+            "descrizione": descrizione,
+        })
+    return entry_id, descrizione
+
+
+def _format_single_confirmation(
+    tx: dict,
+    display_name: str,
+) -> str:
+    """Riproduce il messaggio di conferma usato dal flusso single."""
+    tipo = tx.get("tipo")
+    emoji = "💚" if tipo == "entrata" else "🔴"
+    eur = tx.get("importo_eur", "")
+    le = tx.get("importo_le", "")
+    if eur and str(eur) != "":
+        importo_str = f"€{eur}"
+    else:
+        importo_str = f"{le} LE"
+    account_code = tx.get("account_code") or (
+        "ricavi_escursioni" if tipo == "entrata" else "costi_altri"
+    )
+    descrizione = tx.get("descrizione", "")
+    return (
+        f"{emoji} Registrato nel giornale!\n\n"
+        f"📝 {descrizione}\n"
+        f"💶 {importo_str}\n"
+        f"🏷️ {account_code}\n"
+        f"👤 {display_name}\n"
+        f"📅 {datetime.now().strftime('%d/%m/%Y')}"
+    )
+
+
+def _parse_confirmation(text: str, n_transactions: int) -> tuple[str, list[int] | None]:
+    """Interpreta la risposta dell'utente al preview.
+
+    Ritorna:
+      ("all", None) → registra tutte
+      ("none", None) → annulla
+      ("subset", [indici 0-based]) → registra solo quelle
+      ("unknown", None) → non capito
+    """
+    if not text:
+        return "unknown", None
+    t = text.strip().lower()
+
+    if t in {"ok", "si", "sì", "yes", "conferma", "confermo", "y"}:
+        return "all", None
+    if t in {"no", "annulla", "cancel", "n"}:
+        return "none", None
+
+    # "solo 1,3" / "solo 1, 3" / "1,3" / "1 3" / "solo 2"
+    cleaned = re.sub(r"^solo\s+", "", t)
+    # Accetta separatori virgola/spazio
+    parts = re.split(r"[,\s]+", cleaned.strip())
+    parts = [p for p in parts if p]
+    if parts and all(p.isdigit() for p in parts):
+        nums = sorted({int(p) for p in parts})
+        # Validità: tutti gli indici devono essere in [1..n]
+        if nums and all(1 <= n <= n_transactions for n in nums):
+            return "subset", [n - 1 for n in nums]
+    return "unknown", None
+
+
+def _confirmation_help_text(n: int) -> str:
+    return (
+        "🤔 Non ho capito. Rispondi con:\n"
+        '• "ok" → registro tutte\n'
+        '• "no" → annullo\n'
+        f'• "solo 1,2" → registro solo quelle (numeri da 1 a {n}, '
+        "separati da virgola)"
+    )
+
+
+# ============================================================
 # Handlers
 # ============================================================
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -463,82 +740,154 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # 4. Guide / proprieta: parse with Claude
+    # 4. Pending preview? Se sì, gestiamo conferma/annullo/subset PRIMA di
+    # qualsiasi altra logica. Anche un timeout viene gestito qui.
+    pending = _pending_previews.get(user.id)
+    if pending:
+        age = datetime.utcnow() - pending["created_at"]
+        if age > timedelta(minutes=PREVIEW_TIMEOUT_MIN):
+            # Timeout: drop e processa il messaggio corrente normalmente
+            _pending_previews.pop(user.id, None)
+            await update.message.reply_text(
+                "⏰ Il preview precedente è scaduto. Rimanda il messaggio "
+                "per vedere la nuova anteprima."
+            )
+            return
+        # Preview ancora valida → tenta di interpretare come risposta
+        action, indices = _parse_confirmation(text, len(pending["transactions"]))
+        if action == "unknown":
+            await update.message.reply_text(
+                _confirmation_help_text(len(pending["transactions"]))
+            )
+            return
+        if action == "none":
+            _pending_previews.pop(user.id, None)
+            await update.message.reply_text("🚫 Annullato. Niente registrato.")
+            return
+        # all / subset → scrivi le selezionate
+        selected = (
+            pending["transactions"]
+            if action == "all"
+            else [pending["transactions"][i] for i in indices]
+        )
+        _pending_previews.pop(user.id, None)
+        await context.bot.send_chat_action(chat_id=chat.id, action="typing")
+        results = []
+        for tx in selected:
+            entry_id, descr = _write_one_transaction(
+                tx,
+                cassa_account=pending["cassa_account"],
+                telegram_user_id=user.id,
+                user_first_name=user.first_name or "",
+            )
+            mark = "✅" if entry_id else "❌"
+            results.append(f"{mark} {_format_amount(tx)} {descr or '(senza descr)'}")
+        n_ok = sum(1 for r in results if r.startswith("✅"))
+        header = (
+            f"💾 Registrate {n_ok}/{len(selected)} transazioni:\n\n"
+            if len(selected) > 1
+            else ""
+        )
+        await update.message.reply_text(header + "\n".join(results))
+        return
+
+    # 5. Guide / proprieta: detect multi-transaction PRIMA di chiamare Claude
     await context.bot.send_chat_action(chat_id=chat.id, action="typing")
+    n_starts = _count_transaction_starts(text)
+
+    if n_starts >= 2:
+        # --- Multi-transaction path ---
+        pieces = _split_transactions(text)
+        transactions = []
+        for piece in pieces:
+            response = await ask_claude(piece)
+            tx = _parse_claude_transaction(response)
+            if tx is None:
+                # Una sotto-transazione non parsata → segnaliamo e continuiamo
+                # mettendola comunque in coda con flag suspect.
+                transactions.append({
+                    "tipo": "entrata" if piece.lstrip().startswith("+") else "uscita",
+                    "importo_eur": "",
+                    "importo_le": "",
+                    "descrizione": piece[:60],
+                    "account_code": "costi_altri",
+                    "needs_review": True,
+                })
+            else:
+                transactions.append(tx)
+
+        if not transactions:
+            await update.message.reply_text(
+                "❌ Non sono riuscito a parsare nessuna transazione."
+            )
+            return
+
+        # Sostituisci eventuale preview pendente (già rimosso sopra in caso di
+        # timeout; qui copriamo il caso "utente lascia preview e ne crea altra")
+        warn_replaced = user.id in _pending_previews
+        _pending_previews[user.id] = {
+            "transactions": transactions,
+            "created_at": datetime.utcnow(),
+            "cassa_account": tg_user["account_code"],
+        }
+        preview = _format_preview(transactions)
+        if warn_replaced:
+            preview = (
+                "⚠️ Ho sostituito il preview precedente.\n\n" + preview
+            )
+        await update.message.reply_text(preview)
+        return
+
+    # --- Single transaction path ---
     response = await ask_claude(text)
 
     if not response.startswith("TRANSACTION:"):
         await update.message.reply_text(response)
         return
 
-    try:
-        tx = json.loads(response.replace("TRANSACTION:", "").strip())
-    except Exception as e:
-        await update.message.reply_text(f"❌ Errore parsing: {e}")
+    tx = _parse_claude_transaction(response)
+    if tx is None:
+        await update.message.reply_text("❌ Errore parsing risposta AI.")
         return
 
-    tipo = tx.get("tipo")
-    # Fallback se Claude non include account_code. Per i ricavi ora abbiamo
-    # solo 2 conti attivi (escursioni + commissioni) e la stragrande maggioranza
-    # degli incassi è per tour/escursioni, quindi ricavi_escursioni è il default.
-    account_code = tx.get("account_code") or (
-        "ricavi_escursioni" if tipo == "entrata" else "costi_altri"
-    )
-    descrizione = tx.get("descrizione", "")
+    # Se l'unica transazione è "sospetta" → passa comunque dal preview
+    suspect, _reason = _is_suspect(tx)
+    if suspect:
+        _pending_previews[user.id] = {
+            "transactions": [tx],
+            "created_at": datetime.utcnow(),
+            "cassa_account": tg_user["account_code"],
+        }
+        await update.message.reply_text(_format_preview([tx]))
+        return
 
-    # 5. Build & insert journal entry
-    lines = _build_economic_lines(
-        tipo=tipo,
+    # Path "veloce" originale: scrivi subito
+    entry_id, descrizione = _write_one_transaction(
+        tx,
         cassa_account=tg_user["account_code"],
-        economic_account=account_code,
-        importo_eur=tx.get("importo_eur"),
-        importo_le=tx.get("importo_le"),
-    )
-    if not lines:
-        await update.message.reply_text("❌ Nessun importo valido nel messaggio.")
-        return
-
-    entry_id = insert_journal_entry(
-        description=descrizione,
-        source="telegram",
         telegram_user_id=user.id,
-        lines=lines,
+        user_first_name=user.first_name or "",
     )
     if not entry_id:
-        await update.message.reply_text(
-            "❌ Errore nel salvare su Supabase. Riprova o contatta Omar."
+        # Distinguiamo: nessun importo valido vs errore Supabase
+        lines_check = _build_economic_lines(
+            tipo=tx.get("tipo"),
+            cassa_account=tg_user["account_code"],
+            economic_account=tx.get("account_code") or "costi_altri",
+            importo_eur=tx.get("importo_eur"),
+            importo_le=tx.get("importo_le"),
         )
+        if not lines_check:
+            await update.message.reply_text("❌ Nessun importo valido nel messaggio.")
+        else:
+            await update.message.reply_text(
+                "❌ Errore nel salvare su Supabase. Riprova o contatta Omar."
+            )
         return
 
-    # 6. Mirror to Google Sheet (only for real economic events, not transfers)
-    _save_to_sheets({
-        "guida": (user.first_name or "")[:8],
-        "tipo": tipo,
-        "importo_eur": tx.get("importo_eur", ""),
-        "importo_le": tx.get("importo_le", ""),
-        "descrizione": descrizione,
-    })
-
-    # 7. Confirm to the user
-    emoji = "💚" if tipo == "entrata" else "🔴"
-    eur = tx.get("importo_eur", "")
-    le = tx.get("importo_le", "")
-    if eur and str(eur) != "":
-        importo_str = f"€{eur}"
-    else:
-        importo_str = f"{le} LE"
-
-    # No parse_mode — account_code like "ricavi_tour" has an underscore
-    # that Markdown would interpret as italic markers → BadRequest.
-    reply = (
-        f"{emoji} Registrato nel giornale!\n\n"
-        f"📝 {descrizione}\n"
-        f"💶 {importo_str}\n"
-        f"🏷️ {account_code}\n"
-        f"👤 {tg_user.get('display_name', '')}\n"
-        f"📅 {datetime.now().strftime('%d/%m/%Y')}"
+    await update.message.reply_text(
+        _format_single_confirmation(tx, tg_user.get("display_name", ""))
     )
-    await update.message.reply_text(reply)
 
 
 # ============================================================

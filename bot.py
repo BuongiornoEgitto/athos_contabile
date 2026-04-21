@@ -19,7 +19,12 @@ import re
 import json
 import requests
 from datetime import datetime, timedelta
-from telegram import Update, BotCommand, BotCommandScopeChat
+from telegram import (
+    Update,
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeAllGroupChats,
+)
 from telegram.ext import (
     Application,
     MessageHandler,
@@ -1274,7 +1279,24 @@ async def _on_startup(application) -> None:
         print(f"[startup] set_my_commands default FAIL: {e}")
         return  # se il default fallisce, non ha senso provare gli scope per-chat
 
+    # 1b. Gruppi: tutti i membri (anche le guide) vedono tutti e 4 i comandi.
+    # Motivo: BotCommandScopeChat(chat_id=user_id) funziona solo in chat
+    # private, non nei gruppi. Per differenziare per-utente in un gruppo
+    # servirebbe BotCommandScopeChatMember(group_id, user_id) e quindi
+    # tenere traccia dei group_id → complessita' in piu' per un beneficio
+    # solo cosmetico: gli handler /raccolgo e /verso gia' filtrano per
+    # ruolo, quindi se una guida clicca il bot risponde "non sei contabile".
+    try:
+        await bot.set_my_commands(
+            ADMIN_COMMANDS, scope=BotCommandScopeAllGroupChats()
+        )
+        print(f"[startup] set_my_commands group-chats OK ({len(ADMIN_COMMANDS)} cmds)")
+    except Exception as e:
+        print(f"[startup] set_my_commands group-chats FAIL: {e}")
+
     # 2. Lista estesa per ogni admin (contabile / proprieta)
+    # Nota: questo scope vale per la chat privata admin↔bot. Nei gruppi
+    # e' gia' stato gestito sopra con AllGroupChats.
     admin_ids = _fetch_admin_user_ids()
     print(f"[startup] admin users trovati: {admin_ids}")
     for uid in admin_ids:

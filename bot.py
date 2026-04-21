@@ -963,11 +963,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# Slash commands — contabile only
+# Slash commands — contabile + proprieta
 # ============================================================
-async def _require_contabile(update: Update):
-    """Upsert the user and return their telegram_users row IFF they're contabile.
-    On any rejection, replies to the user and returns None."""
+# /raccolgo e /verso funzionano sia per il contabile che per la proprieta.
+# Il conto mittente/destinatario della scrittura contabile viene preso
+# dall'account_code dell'utente che scrive:
+#   - se scrive Amr (contabile) → cassa_contabile
+#   - se scrive Omar (proprieta) → proprieta
+# Cosi' entrambi possono registrare movimenti coerenti con dove stanno
+# fisicamente i soldi (nel caso di Omar che incontra una guida in ufficio
+# e raccoglie direttamente senza passare da Amr).
+async def _require_admin(update: Update):
+    """Upsert the user and return their telegram_users row IFF they have
+    admin role (contabile or proprieta). On rejection, replies and returns None."""
     upsert_telegram_user(update.effective_user)
     tg_user = get_telegram_user(update.effective_user.id)
 
@@ -977,9 +985,9 @@ async def _require_contabile(update: Update):
         )
         return None
 
-    if tg_user.get("role") != "contabile":
+    if tg_user.get("role") not in ("contabile", "proprieta"):
         await update.message.reply_text(
-            "🚫 Solo il contabile può usare questo comando."
+            "🚫 Solo contabile o proprieta possono usare questo comando."
         )
         return None
 
@@ -989,12 +997,20 @@ async def _require_contabile(update: Update):
 async def cmd_raccolgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/raccolgo <importo> <guida>  — es. /raccolgo 200 saif
 
-    dare  cassa_contabile       <importo>
-    avere cassa_guida_<guida>   <importo>
+    Scrittura:
+      dare  <conto di chi raccoglie>  <importo>
+      avere cassa_guida_<guida>       <importo>
+
+    Il conto mittente e' preso dall'account_code dell'utente che scrive:
+      - contabile → cassa_contabile
+      - proprieta → proprieta
     """
-    tg_user = await _require_contabile(update)
+    tg_user = await _require_admin(update)
     if not tg_user:
         return
+
+    receiver_account = tg_user["account_code"]
+    receiver_name = tg_user.get("display_name") or "admin"
 
     args = context.args
     if len(args) < 2:
@@ -1029,11 +1045,11 @@ async def cmd_raccolgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     entry_id = insert_journal_entry(
-        description=f"Raccolta da {guida['display_name']}",
+        description=f"Raccolta da {guida['display_name']} (a {receiver_name})",
         source="telegram",
         telegram_user_id=update.effective_user.id,
         lines=[
-            {"account_code": "cassa_contabile",
+            {"account_code": receiver_account,
              "dare": importo, "avere": 0, "currency": "EUR"},
             {"account_code": guida["account_code"],
              "dare": 0, "avere": importo, "currency": "EUR"},
@@ -1043,23 +1059,31 @@ async def cmd_raccolgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Errore nel registrare. Riprova.")
         return
 
-    # No parse_mode — literal "cassa_contabile" contains an underscore
-    # that breaks Markdown entity parsing.
+    # No parse_mode — account codes contain underscores che rompono il Markdown.
     await update.message.reply_text(
         f"✅ Raccolto €{importo:.2f} da {guida['display_name']}\n\n"
-        f"I soldi sono ora in cassa del contabile."
+        f"I soldi sono ora in {receiver_account} ({receiver_name})."
     )
 
 
 async def cmd_verso(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/verso <importo> <destinazione>  — es. /verso 2000 omar | /verso 500 banca
 
-    dare  <destinazione>    <importo>
-    avere cassa_contabile   <importo>
+    Scrittura:
+      dare  <destinazione>         <importo>
+      avere <conto di chi versa>   <importo>
+
+    Il conto mittente e' preso dall'account_code dell'utente che scrive:
+      - contabile → cassa_contabile
+      - proprieta → proprieta
+    Un admin non puo' versare a se stesso (no-op contabile).
     """
-    tg_user = await _require_contabile(update)
+    tg_user = await _require_admin(update)
     if not tg_user:
         return
+
+    sender_account = tg_user["account_code"]
+    sender_name = tg_user.get("display_name") or "admin"
 
     args = context.args
     if len(args) < 2:
@@ -1097,14 +1121,22 @@ async def cmd_verso(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Omar che versa a proprieta (cioe' a se stesso) e' un no-op: blocca.
+    if dest_account == sender_account:
+        await update.message.reply_text(
+            f"❌ Non puoi versare da {sender_account} a se stesso.\n"
+            f"Se vuoi spostare soldi, scegli una destinazione diversa (es. banca)."
+        )
+        return
+
     entry_id = insert_journal_entry(
-        description=f"Versamento a {dest_account}",
+        description=f"Versamento a {dest_account} (da {sender_name})",
         source="telegram",
         telegram_user_id=update.effective_user.id,
         lines=[
             {"account_code": dest_account,
              "dare": importo, "avere": 0, "currency": "EUR"},
-            {"account_code": "cassa_contabile",
+            {"account_code": sender_account,
              "dare": 0, "avere": importo, "currency": "EUR"},
         ],
     )
@@ -1112,10 +1144,10 @@ async def cmd_verso(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Errore nel registrare. Riprova.")
         return
 
+    # No parse_mode — account codes contain underscores.
     await update.message.reply_text(
-        f"✅ *Versati €{importo:.2f} a {dest_account}*\n\n"
-        f"Cassa contabile aggiornata.",
-        parse_mode="Markdown",
+        f"✅ Versati €{importo:.2f} a {dest_account}\n\n"
+        f"{sender_account} ({sender_name}) aggiornato."
     )
 
 

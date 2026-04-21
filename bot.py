@@ -19,7 +19,7 @@ import re
 import json
 import requests
 from datetime import datetime, timedelta
-from telegram import Update
+from telegram import Update, BotCommand, BotCommandScopeChat
 from telegram.ext import (
     Application,
     MessageHandler,
@@ -827,8 +827,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # (replaced_pending è True, pending è già stato pop dal dict)
 
     # 5. Guide / proprieta: detect multi-transaction PRIMA di chiamare Claude
-    await context.bot.send_chat_action(chat_id=chat.id, action="typing")
     n_starts = _count_transaction_starts(text)
+
+    # Pre-Claude filter: scarta messaggi che NON sembrano transazioni.
+    # `_count_transaction_starts` ritorna 0 quando non trova nessun segno
+    # +/- attaccato a un numero, ne' una keyword (entrata/uscita/incasso/
+    # spesa) vicino a un numero. In quel caso e' inutile (e rischioso)
+    # interrogare Claude: a volte "interpretava" creativamente messaggi
+    # tipo "ciao Amr" o "domani 3 escursioni" provando a parsarli, e la
+    # guida riceveva "Errore parsing..." senza capire perche'.
+    # Ora rispondiamo con un messaggio educativo e ci fermiamo subito —
+    # zero token sprecati, zero righe spurie nel journal.
+    if n_starts == 0:
+        await update.message.reply_text(
+            "🤔 Questo non sembra una transazione.\n\n"
+            "Per registrare un movimento usa il segno + o -:\n"
+            "`+200 tour piramidi` → incasso EUR\n"
+            "`-50 cammello` → spesa EUR\n"
+            "`+500 LE commissione` → incasso lire\n\n"
+            "Oppure /whoami per vedere il tuo profilo.",
+            parse_mode="Markdown",
+        )
+        return
+
+    await context.bot.send_chat_action(chat_id=chat.id, action="typing")
 
     if n_starts >= 2:
         # --- Multi-transaction path ---
@@ -1183,9 +1205,100 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================================
 # Main
 # ============================================================
+# ============================================================
+# Telegram bot commands (the "/" dropdown)
+# ============================================================
+# Telegram mostra il dropdown dei comandi solo se il bot ha chiamato
+# `setMyCommands`. Senza quella chiamata i comandi *funzionano* lo stesso
+# (gli handler ci sono) ma l'utente non vede l'autocomplete quando scrive
+# "/" → confondente.
+#
+# Strategia per ruolo:
+#   - Default scope (qualsiasi utente, incl. guide): solo /start /whoami
+#   - Per-chat scope (per ogni admin = contabile o proprieta): aggiungo
+#     /raccolgo e /verso. Gli altri comandi rimangono nascosti ai non-admin
+#     cosi' la guida non viene confusa da bottoni che non puo' usare.
+#
+# Limite noto: BotCommandScopeChat funziona solo se il bot ha gia' avuto
+# almeno un'interazione con quell'utente (altrimenti Telegram restituisce
+# "chat not found"). Se aggiungiamo un nuovo contabile dopo aver gia'
+# fatto deploy, dovra' fare /start UNA volta e poi serve un riavvio del
+# bot perche' veda /raccolgo /verso. Per la rosa attuale (Amr + Omar)
+# entrambi hanno gia' interagito → nessun problema.
+GUIDA_COMMANDS = [
+    BotCommand("start", "Istruzioni e info ruolo"),
+    BotCommand("whoami", "Vedi chi sei nel sistema"),
+]
+ADMIN_COMMANDS = [
+    BotCommand("start", "Istruzioni e info ruolo"),
+    BotCommand("raccolgo", "Incassa soldi da una guida"),
+    BotCommand("verso", "Versa soldi a proprieta o banca"),
+    BotCommand("whoami", "Vedi chi sei nel sistema"),
+]
+
+
+def _fetch_admin_user_ids() -> list[int]:
+    """Ritorna i telegram_user_id di chi ha role contabile o proprieta.
+    Usato a startup per impostare la lista comandi 'admin' su quei chat
+    specifici. Se Supabase non e' configurato o la query fallisce, ritorna
+    lista vuota e si usa solo lo scope di default."""
+    if not _sb_configured():
+        return []
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/telegram_users",
+            headers=_sb_headers(),
+            params={
+                "select": "telegram_user_id",
+                "role": "in.(contabile,proprieta)",
+            },
+            timeout=10,
+        )
+        r.raise_for_status()
+        return [int(row["telegram_user_id"]) for row in r.json()]
+    except Exception as e:
+        print(f"[startup] fetch admin users fallito: {e}")
+        return []
+
+
+async def _on_startup(application) -> None:
+    """post_init hook: registra i comandi su Telegram cosi' compaiono nel
+    dropdown quando l'utente scrive '/'. Va eseguito UNA volta a ogni
+    avvio del bot — la registrazione e' idempotente lato Telegram."""
+    bot = application.bot
+    # 1. Default per tutti (guide incluse, e nuovi utenti non ancora mappati)
+    try:
+        await bot.set_my_commands(GUIDA_COMMANDS)
+        print(f"[startup] set_my_commands default OK ({len(GUIDA_COMMANDS)} cmds)")
+    except Exception as e:
+        print(f"[startup] set_my_commands default FAIL: {e}")
+        return  # se il default fallisce, non ha senso provare gli scope per-chat
+
+    # 2. Lista estesa per ogni admin (contabile / proprieta)
+    admin_ids = _fetch_admin_user_ids()
+    print(f"[startup] admin users trovati: {admin_ids}")
+    for uid in admin_ids:
+        try:
+            await bot.set_my_commands(
+                ADMIN_COMMANDS,
+                scope=BotCommandScopeChat(chat_id=uid),
+            )
+            print(f"[startup] set_my_commands admin {uid} OK")
+        except Exception as e:
+            # Caso tipico: l'utente non ha mai scritto al bot in privato →
+            # "Bad Request: chat not found". Non e' fatale: vedra' i comandi
+            # default e potra' comunque digitare /raccolgo /verso a mano.
+            print(f"[startup] set_my_commands admin {uid} skip ({e})")
+
+
 def main():
     print("🚀 Athos Bot (double-entry) avviato...")
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(_on_startup)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("raccolgo", cmd_raccolgo))
     app.add_handler(CommandHandler("verso", cmd_verso))

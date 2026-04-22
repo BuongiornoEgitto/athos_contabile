@@ -754,15 +754,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     role = tg_user.get("role")
 
-    # 3. If contabile: redirect to slash commands
-    if role == "contabile":
-        await update.message.reply_text(
-            "👔 Come contabile usi comandi diversi:\n\n"
-            "`/raccolgo 200 saif` — ricevi da una guida\n"
-            "`/verso 2000 omar` — consegni alla proprieta",
-            parse_mode="Markdown",
-        )
-        return
+    # 3. Role check: qualsiasi utente mappato (guida, contabile, proprieta)
+    # puo' usare la sintassi "+X ..." / "-X ..." per registrare ricavi/costi
+    # sulla propria cassa. Il conto DARE/AVERE viene da tg_user["account_code"]
+    # (cassa_guida_X, cassa_contabile, proprieta). I comandi slash /raccolgo
+    # e /verso restano per i trasferimenti fra casse.
 
     # 4. Pending preview? Se sì, gestiamo conferma/annullo/subset PRIMA di
     # qualsiasi altra logica. Anche un timeout viene gestito qui.
@@ -1187,16 +1183,19 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # --- Contabile (Amr): only transfer slash commands ---
+    # --- Contabile (Amr): can now do both (economic events AND transfers) ---
     if role == "contabile":
         await update.message.reply_text(
             f"👔 Ciao {display_name}! Sei registrato come *contabile*.\n\n"
-            "*I tuoi comandi:*\n"
+            "*Registrare incassi/spese (come le guide):*\n"
+            "`+200 tour piramidi` → incasso in euro\n"
+            "`+500 EGP commissione hotel` → incasso in lire\n"
+            "`-50 pranzo clienti` → spesa in euro\n"
+            "`-1000 LE biglietto museo` → spesa in lire\n\n"
+            "*Comandi per trasferimenti fra casse:*\n"
             "`/raccolgo 200 saif` — ricevi soldi da una guida\n"
             "`/verso 2000 omar` — consegni soldi alla proprieta\n"
-            "`/verso 500 banca` — versi in banca (quando attiva)\n\n"
-            "💡 Usa il nome della guida come appare in Telegram "
-            "(es: saif, abozeidm, maja).\n\n"
+            "`/verso 500 banca` — versi in banca\n\n"
             "🔎 /whoami — controlla il tuo stato",
             parse_mode="Markdown",
         )

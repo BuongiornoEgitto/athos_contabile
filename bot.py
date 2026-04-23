@@ -429,10 +429,12 @@ def _build_economic_lines(
 # Multi-transaction parsing & preview helpers
 # ============================================================
 # Token che marca l'inizio di una transazione: +/- seguiti da numero, oppure
-# parole chiave (entrata/uscita/incasso/spesa) seguite — anche con altre
-# parole in mezzo — da un numero. Usato sia per il conteggio (detection) sia
-# per lo split. Case-insensitive.
-_KEYWORD_TOKENS = r"entrata|uscita|incasso|spesa"
+# parole chiave (entrata/uscita/incasso/spesa/in/out/pagato/ricevuto/speso/
+# costo/pagamento) seguite — anche con altre parole in mezzo — da un numero.
+# Allineato al system prompt di Claude (vedi righe 77-78). Il \b nella regex
+# evita falsi positivi tipo "incoming" (in), "output" (out), "pagatoltre" (pagato).
+# Usato sia per il conteggio (detection) sia per lo split. Case-insensitive.
+_KEYWORD_TOKENS = r"entrata|uscita|incasso|spesa|in|out|pagato|ricevuto|speso|costo|pagamento"
 # Per la detection accettiamo tokens "ragionevoli": +/- attaccati a un numero,
 # oppure una keyword che precede un numero entro pochi caratteri.
 _DETECT_PATTERN = re.compile(
@@ -864,9 +866,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Una sotto-transazione non parsata → segnaliamo e continuiamo
                 # mettendola comunque in coda con flag suspect.
                 # Il fallback per "tipo" guarda sia il segno che le keyword
-                # (entrata/incasso → entrata, altrimenti → uscita).
+                # (entrata/incasso/in/ricevuto → entrata, altrimenti → uscita).
                 piece_lower = piece.lstrip().lower()
-                if re.match(r"^(\+|entrata|incasso|in\s)", piece_lower):
+                if re.match(r"^(\+|entrata|incasso|in\s|ricevuto)", piece_lower):
                     fallback_tipo = "entrata"
                 else:
                     fallback_tipo = "uscita"

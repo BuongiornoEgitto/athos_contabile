@@ -112,6 +112,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text or text.startswith("@"):
         return
 
+    # FILTRO: ignora messaggi che non sembrano transazioni (zero token)
+    text_lower = text.lower().strip()
+    parole_chiave = ["spesa", "uscita", "out ", "pagamento", "costo", "in ", "incasso", "entrata", "pagato"]
+
+    is_transaction = (
+        text.startswith("+") or
+        text.startswith("-") or
+        any(text_lower.startswith(p) for p in parole_chiave)
+    )
+
+    if not is_transaction:
+        return
+
     await context.bot.send_chat_action(chat_id=chat.id, action="typing")
 
     response = await ask_claude(text)

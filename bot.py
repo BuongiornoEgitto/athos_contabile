@@ -1253,9 +1253,8 @@ async def cmd_paga_fornitore(update: Update, context: ContextTypes.DEFAULT_TYPE)
     ])
 
     await update.message.reply_text(
-        "💼 *Pagamento fornitore*\n\nScegli il fornitore:",
+        "💼 Pagamento fornitore\n\nScegli il fornitore:",
         reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown",
     )
     return PAY_SUPPLIER
 
@@ -1278,9 +1277,9 @@ async def pf_on_supplier(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["pf_supplier"] = supplier_code
 
     await query.edit_message_text(
-        f"💼 Fornitore: *{_supplier_label(supplier_code)}*\n\n"
-        f"💰 Quanto stai pagando (€)?\n_Scrivi solo il numero, es. 450_",
-        parse_mode="Markdown",
+        f"💼 Fornitore: {_supplier_label(supplier_code)}\n\n"
+        f"💰 Quanto stai pagando (€)?\n"
+        f"Scrivi solo il numero, es. 450"
     )
     return PAY_AMOUNT
 
@@ -1312,11 +1311,10 @@ async def pf_on_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]]
 
     await update.message.reply_text(
-        f"💼 Fornitore: *{supplier_label}*\n"
-        f"💰 Importo: *€{importo:.2f}*\n\n"
+        f"💼 Fornitore: {supplier_label}\n"
+        f"💰 Importo: €{importo:.2f}\n\n"
         f"🏦 Da quale cassa esce?",
         reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown",
     )
     return PAY_CASSA
 
@@ -1346,15 +1344,18 @@ async def pf_on_cassa(update: Update, context: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("❌ Annulla",  callback_data="pf_cancel"),
     ]]
 
+    # NB: NIENTE parse_mode="Markdown" qui — il nome del conto contiene
+    # underscore (costi_escursioni) che Telegram interpreta come italic
+    # delimiter, causando 400 BAD REQUEST su edit_message_text e bloccando
+    # il flow. Plain text + emoji = sicuro a prescindere dal payload.
     await query.edit_message_text(
-        f"📋 *Riepilogo pagamento*\n\n"
+        "📋 Riepilogo pagamento\n\n"
         f"• Fornitore: {_supplier_label(supplier_code)}\n"
         f"• Importo: €{importo:.2f}\n"
         f"• Esce da: {_cassa_label(cassa_code)}\n"
-        f"• Categoria: {PAYFORN_COST_ACCOUNT}\n\n"
-        f"_Confermi?_",
+        f"• Categoria: Escursioni\n\n"
+        "Confermi?",
         reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown",
     )
     return PAY_CONFIRM
 
@@ -1409,10 +1410,12 @@ async def pf_on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.clear()
         return ConversationHandler.END
 
+    # No parse_mode: i label sono safe oggi ma se Omar in futuro aggiunge
+    # un fornitore con underscore nel nome (improbabile ma possibile) il
+    # messaggio si rompe. Plain text e' a prova di payload.
     await query.edit_message_text(
-        f"✅ *Pagato €{importo:.2f} a {supplier_label}*\n\n"
-        f"_{cassa_label} aggiornata. Vedi il movimento nella dashboard._",
-        parse_mode="Markdown",
+        f"✅ Pagato €{importo:.2f} a {supplier_label}\n\n"
+        f"{cassa_label} aggiornata. Vedi il movimento nella dashboard."
     )
     context.user_data.clear()
     return ConversationHandler.END

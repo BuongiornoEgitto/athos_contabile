@@ -1386,20 +1386,39 @@ async def pf_on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     supplier_label = _supplier_label(supplier_code)
     cassa_label    = _cassa_label(cassa_code)
-    description    = f"Pagamento {supplier_label.lstrip('🌊🐎🚌🤿🛥📦 ')} €{importo:.2f}"
+    description    = f"Pagamento {supplier_label.lstrip('🌊✈️🚌🤿🛥📦 ')} €{importo:.2f}"
 
-    # Scrittura partita doppia (in_mano = 0 → niente cassa_fornitore_X):
-    #   DARE  costi_escursioni    importo
-    #   AVERE cassa_pagatrice     importo
+    # Scrittura partita doppia "passing-through" su cassa_fornitore_X (4 righe).
+    # Cambio del 27/04/2026 (richiesta Omar): il vecchio pattern 2-righe
+    # registrava solo costo + cassa pagatrice e non toccava cassa_fornitore_X
+    # → l'estratto conto del fornitore non mostrava il pagamento.
+    #
+    # Ora il pagamento "passa attraverso" il conto del fornitore:
+    #   1) Riconosci il debito (lui ha reso servizio):
+    #      DARE  costi_escursioni              importo  ← costo in P&L
+    #      AVERE cassa_fornitore_X             importo  ← gli dobbiamo
+    #   2) Saldi il debito (paghi):
+    #      DARE  cassa_fornitore_X             importo  ← chiudi debito
+    #      AVERE cassa_pagatrice               importo  ← esce cassa
+    #
+    # Net effect su cassa_fornitore_X: 0 (debito creato + chiuso). Ma i 2
+    # movimenti restano visibili nell'estratto conto del fornitore.
+    imp_round = round(importo, 2)
     entry_id = insert_journal_entry(
         description=description,
         source="telegram",
         telegram_user_id=update.effective_user.id,
         lines=[
+            # Step 1: cost recognition + debt arises
             {"account_code": PAYFORN_COST_ACCOUNT,
-             "dare": round(importo, 2), "avere": 0, "currency": "EUR"},
+             "dare": imp_round, "avere": 0, "currency": "EUR"},
+            {"account_code": supplier_code,
+             "dare": 0, "avere": imp_round, "currency": "EUR"},
+            # Step 2: debt cleared via cash payment
+            {"account_code": supplier_code,
+             "dare": imp_round, "avere": 0, "currency": "EUR"},
             {"account_code": cassa_code,
-             "dare": 0, "avere": round(importo, 2), "currency": "EUR"},
+             "dare": 0, "avere": imp_round, "currency": "EUR"},
         ],
     )
 

@@ -1184,7 +1184,7 @@ PAY_SUPPLIER, PAY_AMOUNT, PAY_CASSA, PAY_CONFIRM = range(4)
 # - evita query Supabase a ogni /paga_fornitore
 SUPPLIERS = [
     ("cassa_fornitore_shamandura",   "🌊 Shamandura"),
-    ("cassa_fornitore_shaarawy",     "🐎 Shaarawy"),
+    ("cassa_fornitore_shaarawy",     "✈️ Shaarawy"),
     ("cassa_fornitore_ramadan",      "🚌 Ramadan"),
     ("cassa_fornitore_sottomarino",  "🤿 Sottomarino"),
     ("cassa_fornitore_naama_safari", "🛥 Naama Safari"),

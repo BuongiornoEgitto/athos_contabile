@@ -24,11 +24,15 @@ from telegram import (
     BotCommand,
     BotCommandScopeChat,
     BotCommandScopeAllGroupChats,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
 )
 from telegram.ext import (
     Application,
     MessageHandler,
     CommandHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
     filters,
     ContextTypes,
 )
@@ -90,11 +94,12 @@ RICAVI (quando tipo=entrata):
 
 COSTI (quando tipo=uscita):
 - costi_ristoranti → pranzi, cene con clienti, ristoranti
-- costi_escursioni_vari → TUTTE le spese sul momento durante un'escursione:
+- costi_escursioni → TUTTE le spese sul momento durante un'escursione:
   affitto moto/quad/barche/feluche/motoscafi, cammelli e altri animali,
   MANCE a driver/barcaioli/cammellieri/motoristi, attrezzatura piccola
   (snorkeling, pinne, maschere), acqua/snack per clienti durante il tour,
-  piccoli pagamenti al volo al tempio/sito (guide extra, custodi).
+  piccoli pagamenti al volo al tempio/sito (guide extra, custodi),
+  pagamenti a fornitori di escursioni (Shamandura, Shaarawy, ecc.).
 - costi_ingressi → biglietti UFFICIALI siti archeologici, musei, templi
 - costi_trasporti → benzina, taxi, voli interni, bus, treni, transfer aeroporto
 - costi_alloggio → hotel, case, resort per clienti
@@ -109,7 +114,7 @@ COSTI (quando tipo=uscita):
 
 NOTA "commissione" — può essere sia entrata che uscita:
 - se tipo=entrata → ricavi_commissioni (es. guida vende foto e prende %)
-- se tipo=uscita → costi_escursioni_vari (mance/commissioni ai driver durante tour)
+- se tipo=uscita → costi_escursioni (mance/commissioni ai driver durante tour)
 
 REGOLE DESCRIZIONE:
 - Tutto il testo dopo segno/cifra/valuta va in "descrizione"
@@ -119,16 +124,16 @@ ESEMPI:
 "+150 escursione deserto" → TRANSACTION:{"tipo":"entrata","importo_eur":150,"importo_le":"","descrizione":"escursione deserto","account_code":"ricavi_escursioni"}
 "+300 Mario Rossi Hotel Sunrise" → TRANSACTION:{"tipo":"entrata","importo_eur":300,"importo_le":"","descrizione":"Mario Rossi Hotel Sunrise","account_code":"ricavi_escursioni"}
 "-50 pranzo clienti" → TRANSACTION:{"tipo":"uscita","importo_eur":50,"importo_le":"","descrizione":"pranzo clienti","account_code":"costi_ristoranti"}
-"-300 cammello" → TRANSACTION:{"tipo":"uscita","importo_eur":300,"importo_le":"","descrizione":"cammello","account_code":"costi_escursioni_vari"}
-"-50 mancia motorista" → TRANSACTION:{"tipo":"uscita","importo_eur":50,"importo_le":"","descrizione":"mancia motorista","account_code":"costi_escursioni_vari"}
-"-20 acqua clienti" → TRANSACTION:{"tipo":"uscita","importo_eur":20,"importo_le":"","descrizione":"acqua clienti","account_code":"costi_escursioni_vari"}
-"-100 LE snorkeling" → TRANSACTION:{"tipo":"uscita","importo_eur":"","importo_le":100,"descrizione":"snorkeling","account_code":"costi_escursioni_vari"}
+"-300 cammello" → TRANSACTION:{"tipo":"uscita","importo_eur":300,"importo_le":"","descrizione":"cammello","account_code":"costi_escursioni"}
+"-50 mancia motorista" → TRANSACTION:{"tipo":"uscita","importo_eur":50,"importo_le":"","descrizione":"mancia motorista","account_code":"costi_escursioni"}
+"-20 acqua clienti" → TRANSACTION:{"tipo":"uscita","importo_eur":20,"importo_le":"","descrizione":"acqua clienti","account_code":"costi_escursioni"}
+"-100 LE snorkeling" → TRANSACTION:{"tipo":"uscita","importo_eur":"","importo_le":100,"descrizione":"snorkeling","account_code":"costi_escursioni"}
 "-1000 LE guida canyon" → TRANSACTION:{"tipo":"uscita","importo_eur":"","importo_le":1000,"descrizione":"guida canyon","account_code":"costi_guide_esterne"}
 "-500 LE biglietto valle re" → TRANSACTION:{"tipo":"uscita","importo_eur":"","importo_le":500,"descrizione":"biglietto valle re","account_code":"costi_ingressi"}
 "+100 commissione foto" → TRANSACTION:{"tipo":"entrata","importo_eur":100,"importo_le":"","descrizione":"commissione foto","account_code":"ricavi_commissioni"}
-"-30 commissione driver" → TRANSACTION:{"tipo":"uscita","importo_eur":30,"importo_le":"","descrizione":"commissione driver","account_code":"costi_escursioni_vari"}
+"-30 commissione driver" → TRANSACTION:{"tipo":"uscita","importo_eur":30,"importo_le":"","descrizione":"commissione driver","account_code":"costi_escursioni"}
 "entrata 100 commissione foto" → TRANSACTION:{"tipo":"entrata","importo_eur":100,"importo_le":"","descrizione":"commissione foto","account_code":"ricavi_commissioni"}
-"uscita 30 acqua clienti" → TRANSACTION:{"tipo":"uscita","importo_eur":30,"importo_le":"","descrizione":"acqua clienti","account_code":"costi_escursioni_vari"}
+"uscita 30 acqua clienti" → TRANSACTION:{"tipo":"uscita","importo_eur":30,"importo_le":"","descrizione":"acqua clienti","account_code":"costi_escursioni"}
 
 Rispondi SOLO con il JSON nel formato:
 TRANSACTION:{"tipo":"...","importo_eur":...,"importo_le":"...","descrizione":"...","account_code":"..."}
@@ -1149,6 +1154,278 @@ async def cmd_verso(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ============================================================
+# /paga_fornitore — registra pagamento fornitore con flow conversazionale
+# ============================================================
+# Aggiunto 26/04/2026 (richiesta Omar). Permette a contabile/proprieta di
+# registrare via Telegram un pagamento a uno dei fornitori (Shamandura,
+# Shaarawy, ecc.) senza dover aprire la dashboard. Flow a step:
+#   1. /paga_fornitore     → tastiera con i 6 fornitori
+#   2. tap fornitore       → chiede importo (€)
+#   3. risposta numero     → tastiera con casse pagatrici
+#   4. tap cassa           → mostra riepilogo + ✅/❌
+#   5. tap conferma        → scrive su Supabase, conferma all'utente
+#
+# Scrittura partita doppia generata (default in_mano=0 → no compensazione
+# cassa_fornitore_X; identica al caso "in_mano=0" della dashboard
+# register_supplier_payment):
+#   DARE  costi_escursioni    importo
+#   AVERE cassa_pagatrice     importo
+#
+# Per casi rari con compensazione (fornitore aveva soldi in mano dai
+# clienti) → usare la dashboard, non il bot.
+# ============================================================
+
+# Stati del ConversationHandler
+PAY_SUPPLIER, PAY_AMOUNT, PAY_CASSA, PAY_CONFIRM = range(4)
+
+# Lista fornitori (code → label). Hardcoded perche':
+# - cambia raramente (nuovo fornitore = side-task migration + redeploy bot)
+# - evita query Supabase a ogni /paga_fornitore
+SUPPLIERS = [
+    ("cassa_fornitore_shamandura",   "🌊 Shamandura"),
+    ("cassa_fornitore_shaarawy",     "🐎 Shaarawy"),
+    ("cassa_fornitore_ramadan",      "🚌 Ramadan"),
+    ("cassa_fornitore_sottomarino",  "🤿 Sottomarino"),
+    ("cassa_fornitore_naama_safari", "🛥 Naama Safari"),
+    ("cassa_fornitori_vari",         "📦 Vari"),
+]
+
+# Casse pagatrici disponibili (chi ha materialmente i soldi che escono)
+PAYER_CASSE = [
+    ("cassa_contabile", "Cassa Contabile"),
+    ("proprieta",       "Cassa Omar (proprietà)"),
+]
+
+# Categoria di costo fissa per i pagamenti fornitore via bot. Se in futuro
+# servisse differenziare (es. trasporti per Naama Safari), aggiungere step
+# di scelta categoria. Per ora 90% dei pagamenti = escursioni.
+PAYFORN_COST_ACCOUNT = "costi_escursioni"
+
+
+def _supplier_label(code: str) -> str:
+    """Lookup label leggibile per un supplier_code. Ritorna il code stesso
+    come fallback se il fornitore non e' nella lista (no crash)."""
+    for c, label in SUPPLIERS:
+        if c == code:
+            return label
+    return code
+
+
+def _cassa_label(code: str) -> str:
+    """Lookup label leggibile per una cassa pagatrice."""
+    for c, label in PAYER_CASSE:
+        if c == code:
+            return label
+    return code
+
+
+async def cmd_paga_fornitore(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Entry point: /paga_fornitore — mostra tastiera fornitori."""
+    tg_user = await _require_admin(update)
+    if not tg_user:
+        return ConversationHandler.END
+
+    # Reset stato user_data eventuale (se l'utente aveva un flow aperto)
+    context.user_data.pop("pf_supplier", None)
+    context.user_data.pop("pf_amount", None)
+    context.user_data.pop("pf_cassa", None)
+
+    # Costruisci tastiera 2 colonne con i 6 fornitori + bottone annulla
+    keyboard = []
+    for i in range(0, len(SUPPLIERS), 2):
+        row = [
+            InlineKeyboardButton(
+                SUPPLIERS[i][1],
+                callback_data=f"pf_supp:{SUPPLIERS[i][0]}",
+            )
+        ]
+        if i + 1 < len(SUPPLIERS):
+            row.append(
+                InlineKeyboardButton(
+                    SUPPLIERS[i + 1][1],
+                    callback_data=f"pf_supp:{SUPPLIERS[i + 1][0]}",
+                )
+            )
+        keyboard.append(row)
+    keyboard.append([
+        InlineKeyboardButton("❌ Annulla", callback_data="pf_cancel")
+    ])
+
+    await update.message.reply_text(
+        "💼 *Pagamento fornitore*\n\nScegli il fornitore:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown",
+    )
+    return PAY_SUPPLIER
+
+
+async def pf_on_supplier(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 2: utente ha scelto fornitore → chiedi importo."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    if data == "pf_cancel":
+        await query.edit_message_text("❌ Pagamento annullato.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    if not data.startswith("pf_supp:"):
+        return PAY_SUPPLIER  # ignora callback inattese
+
+    supplier_code = data.removeprefix("pf_supp:")
+    context.user_data["pf_supplier"] = supplier_code
+
+    await query.edit_message_text(
+        f"💼 Fornitore: *{_supplier_label(supplier_code)}*\n\n"
+        f"💰 Quanto stai pagando (€)?\n_Scrivi solo il numero, es. 450_",
+        parse_mode="Markdown",
+    )
+    return PAY_AMOUNT
+
+
+async def pf_on_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 3: utente ha scritto importo → mostra tastiera casse."""
+    text = (update.message.text or "").strip().replace(",", ".")
+    try:
+        importo = float(text)
+    except ValueError:
+        await update.message.reply_text(
+            f"❌ '{text}' non è un numero valido. Riprova (es. 450)."
+        )
+        return PAY_AMOUNT
+    if importo <= 0:
+        await update.message.reply_text(
+            "❌ L'importo deve essere maggiore di zero. Riprova."
+        )
+        return PAY_AMOUNT
+
+    context.user_data["pf_amount"] = importo
+    supplier_label = _supplier_label(context.user_data.get("pf_supplier", ""))
+
+    keyboard = [[
+        InlineKeyboardButton(label, callback_data=f"pf_cassa:{code}")
+        for code, label in PAYER_CASSE
+    ], [
+        InlineKeyboardButton("❌ Annulla", callback_data="pf_cancel")
+    ]]
+
+    await update.message.reply_text(
+        f"💼 Fornitore: *{supplier_label}*\n"
+        f"💰 Importo: *€{importo:.2f}*\n\n"
+        f"🏦 Da quale cassa esce?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown",
+    )
+    return PAY_CASSA
+
+
+async def pf_on_cassa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 4: utente ha scelto cassa → mostra riepilogo + conferma."""
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    if data == "pf_cancel":
+        await query.edit_message_text("❌ Pagamento annullato.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    if not data.startswith("pf_cassa:"):
+        return PAY_CASSA
+
+    cassa_code = data.removeprefix("pf_cassa:")
+    context.user_data["pf_cassa"] = cassa_code
+
+    supplier_code = context.user_data.get("pf_supplier", "")
+    importo = context.user_data.get("pf_amount", 0.0)
+
+    keyboard = [[
+        InlineKeyboardButton("✅ Conferma", callback_data="pf_confirm"),
+        InlineKeyboardButton("❌ Annulla",  callback_data="pf_cancel"),
+    ]]
+
+    await query.edit_message_text(
+        f"📋 *Riepilogo pagamento*\n\n"
+        f"• Fornitore: {_supplier_label(supplier_code)}\n"
+        f"• Importo: €{importo:.2f}\n"
+        f"• Esce da: {_cassa_label(cassa_code)}\n"
+        f"• Categoria: {PAYFORN_COST_ACCOUNT}\n\n"
+        f"_Confermi?_",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown",
+    )
+    return PAY_CONFIRM
+
+
+async def pf_on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 5: scrive su Supabase + conferma."""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "pf_cancel":
+        await query.edit_message_text("❌ Pagamento annullato.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    if query.data != "pf_confirm":
+        return PAY_CONFIRM
+
+    supplier_code = context.user_data.get("pf_supplier", "")
+    cassa_code    = context.user_data.get("pf_cassa", "")
+    importo       = float(context.user_data.get("pf_amount", 0.0))
+
+    if not (supplier_code and cassa_code and importo > 0):
+        await query.edit_message_text(
+            "❌ Dati incompleti. Riprova con /paga_fornitore."
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    supplier_label = _supplier_label(supplier_code)
+    cassa_label    = _cassa_label(cassa_code)
+    description    = f"Pagamento {supplier_label.lstrip('🌊🐎🚌🤿🛥📦 ')} €{importo:.2f}"
+
+    # Scrittura partita doppia (in_mano = 0 → niente cassa_fornitore_X):
+    #   DARE  costi_escursioni    importo
+    #   AVERE cassa_pagatrice     importo
+    entry_id = insert_journal_entry(
+        description=description,
+        source="telegram",
+        telegram_user_id=update.effective_user.id,
+        lines=[
+            {"account_code": PAYFORN_COST_ACCOUNT,
+             "dare": round(importo, 2), "avere": 0, "currency": "EUR"},
+            {"account_code": cassa_code,
+             "dare": 0, "avere": round(importo, 2), "currency": "EUR"},
+        ],
+    )
+
+    if not entry_id:
+        await query.edit_message_text(
+            "❌ Errore nel registrare. Riprova con /paga_fornitore."
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    await query.edit_message_text(
+        f"✅ *Pagato €{importo:.2f} a {supplier_label}*\n\n"
+        f"_{cassa_label} aggiornata. Vedi il movimento nella dashboard._",
+        parse_mode="Markdown",
+    )
+    context.user_data.clear()
+    return ConversationHandler.END
+
+
+async def pf_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Comando /annulla durante un flow → reset stato."""
+    context.user_data.clear()
+    if update.message:
+        await update.message.reply_text("❌ Pagamento annullato.")
+    return ConversationHandler.END
+
+
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/whoami — debug: shows how Omar/bot see this user."""
     upsert_telegram_user(update.effective_user)
@@ -1271,6 +1548,7 @@ ADMIN_COMMANDS = [
     BotCommand("start", "Istruzioni e info ruolo"),
     BotCommand("raccolgo", "Incassa soldi da una guida"),
     BotCommand("verso", "Versa soldi a proprieta o banca"),
+    BotCommand("paga_fornitore", "Registra pagamento fornitore (Shamandura, ecc.)"),
     BotCommand("whoami", "Vedi chi sei nel sistema"),
 ]
 
@@ -1358,6 +1636,26 @@ def main():
     app.add_handler(CommandHandler("raccolgo", cmd_raccolgo))
     app.add_handler(CommandHandler("verso", cmd_verso))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
+
+    # /paga_fornitore — flow conversazionale (entry → step → confirm).
+    # Va REGISTRATO PRIMA del MessageHandler globale, altrimenti i messaggi
+    # numerici (importo) verrebbero intercettati da handle_message e
+    # interpretati come transazioni libere.
+    paga_fornitore_conv = ConversationHandler(
+        entry_points=[CommandHandler("paga_fornitore", cmd_paga_fornitore)],
+        states={
+            PAY_SUPPLIER: [CallbackQueryHandler(pf_on_supplier, pattern=r"^pf_(supp|cancel)")],
+            PAY_AMOUNT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, pf_on_amount)],
+            PAY_CASSA:    [CallbackQueryHandler(pf_on_cassa,    pattern=r"^pf_(cassa|cancel)")],
+            PAY_CONFIRM:  [CallbackQueryHandler(pf_on_confirm,  pattern=r"^pf_(confirm|cancel)")],
+        },
+        fallbacks=[CommandHandler("annulla", pf_cancel)],
+        # Per-user: ogni utente ha il suo stato indipendente
+        per_user=True,
+        per_chat=True,
+    )
+    app.add_handler(paga_fornitore_conv)
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.run_polling()
 

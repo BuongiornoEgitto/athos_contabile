@@ -17,6 +17,7 @@ Flow:
 import os
 import re
 import json
+import logging
 import requests
 from datetime import datetime, timedelta
 from telegram import (
@@ -46,6 +47,50 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 SHEETS_URL = os.environ.get("SHEETS_URL")  # legacy — dual-write backup
 ALLOWED_GROUP_ID = None
+
+# ============================================================
+# Constants — Anthropic API + timeouts (estratti per leggibilita')
+# ============================================================
+ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_MODEL = "claude-sonnet-4-6"
+REQUEST_TIMEOUT_SECONDS = 30
+SHEETS_TIMEOUT_SECONDS = 10
+
+# ============================================================
+# Logging — proper structured logging invece di print sparsi
+# ============================================================
+# Mantenuti i print() esistenti per compatibilita' con i log Railway,
+# ma il logger e' disponibile per le nuove funzioni (token usage,
+# errori non-fatali). Livello INFO: vediamo flussi normali + warnings.
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("athos")
+
+
+def validate_environment() -> None:
+    """Fail-fast se mancano env vars critiche. Chiamato in cima a main().
+
+    Senza questo, il bot partiva e poi crashava al primo messaggio con
+    errori difficili da debuggare ("None has no attribute..."). Meglio
+    morire subito con un messaggio chiaro nei log Railway.
+
+    SHEETS_URL e' opzionale (legacy backup, puo' restare vuoto).
+    """
+    required = {
+        "TELEGRAM_TOKEN": TELEGRAM_TOKEN,
+        "ANTHROPIC_API_KEY": ANTHROPIC_API_KEY,
+        "SUPABASE_URL": SUPABASE_URL,
+        "SUPABASE_SERVICE_KEY": SUPABASE_SERVICE_KEY,
+    }
+    missing = [name for name, value in required.items() if not value]
+    if missing:
+        raise RuntimeError(
+            f"❌ Variabili ambiente mancanti su Railway: {', '.join(missing)}. "
+            f"Configurale in Railway → progetto athos_contabile → Variables, "
+            f"poi rideploya."
+        )
 
 # ============================================================
 # Multi-transaction preview state
@@ -344,16 +389,22 @@ def _save_to_sheets(data: dict) -> bool:
 # Claude call
 # ============================================================
 async def ask_claude(user_message: str) -> str:
+    """Chiama Claude per parsare un messaggio in TRANSACTION:{...}.
+
+    Usa prompt caching (cache_control: ephemeral) sul SYSTEM_PROMPT —
+    i messaggi successivi al primo (entro 5min TTL) leggono il prompt
+    cachato → ~80% di risparmio sui token di input.
+    """
     try:
         response = requests.post(
-            "https://api.anthropic.com/v1/messages",
+            ANTHROPIC_MESSAGES_URL,
             headers={
                 "Content-Type": "application/json",
                 "x-api-key": ANTHROPIC_API_KEY,
                 "anthropic-version": "2023-06-01",
             },
             json={
-                "model": "claude-sonnet-4-6",
+                "model": ANTHROPIC_MODEL,
                 "max_tokens": 300,
                 "system": [
                     {
@@ -364,21 +415,43 @@ async def ask_claude(user_message: str) -> str:
                 ],
                 "messages": [{"role": "user", "content": user_message}],
             },
-            timeout=30,
+            timeout=REQUEST_TIMEOUT_SECONDS,
         )
+        # raise_for_status() esplicito → HTTP 4xx/5xx diventa eccezione
+        # invece di silent failure su data["content"] = KeyError piu' tardi.
+        response.raise_for_status()
         data = response.json()
+
         if "error" in data:
-            return f"❌ Errore API: {data['error'].get('message', 'sconosciuto')}"
+            err_msg = data["error"].get("message", "sconosciuto")
+            logger.error(f"Anthropic API error: {err_msg}")
+            return f"❌ Errore API: {err_msg}"
+
+        # Log token usage — cache_read > 0 conferma che il caching funziona
         usage = data.get("usage", {})
-        print(
+        logger.info(
             f"tokens — input: {usage.get('input_tokens', 0)}, "
             f"cache_read: {usage.get('cache_read_input_tokens', 0)}, "
             f"cache_create: {usage.get('cache_creation_input_tokens', 0)}, "
             f"output: {usage.get('output_tokens', 0)}"
         )
-        return data["content"][0]["text"]
-    except Exception as e:
+
+        # Estrazione safe: content puo' essere lista vuota o senza 'text'
+        content = data.get("content") or []
+        if not content or "text" not in content[0]:
+            logger.error(f"Risposta Anthropic inattesa: {str(data)[:300]}")
+            return "❌ Risposta AI non valida. Riprova."
+        return content[0]["text"]
+
+    except requests.HTTPError as e:
+        logger.error(f"Anthropic HTTP error {e.response.status_code}: {e.response.text[:200]}")
+        return f"❌ Errore HTTP AI ({e.response.status_code}). Riprova fra poco."
+    except requests.RequestException as e:
+        logger.exception(f"Anthropic request error: {e}")
         return f"❌ Errore connessione AI: {e}"
+    except (ValueError, KeyError) as e:
+        logger.exception(f"Anthropic response parse error: {e}")
+        return "❌ Risposta AI non valida. Riprova."
 
 
 # ============================================================
@@ -1934,6 +2007,10 @@ async def _on_startup(application) -> None:
 
 
 def main():
+    # Fail-fast su env vars mancanti (errore esplicito invece di crash
+    # criptico al primo messaggio). Vedi validate_environment() in cima.
+    validate_environment()
+
     print("🚀 Athos Bot (double-entry) avviato...")
     app = (
         Application.builder()

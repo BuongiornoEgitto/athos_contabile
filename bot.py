@@ -1448,6 +1448,274 @@ async def pf_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# ============================================================
+# Daily cash snapshot — invio automatico a Omar ogni sera 20:00 Cairo
+# ============================================================
+# Il contabile (Amr) di solito mandava manualmente ogni sera "ho in mano X,
+# oggi entrato Y, uscito Z". Lo automatizziamo: ogni sera alle 20:00 (ora
+# del Cairo) il bot calcola lo snapshot di cassa_contabile dai dati Supabase
+# e invia un messaggio formattato in chat PRIVATA a Omar (NON nel gruppo).
+#
+# chat_id destinatario = telegram_user_id di Omar (= chat_id privato col bot
+# in Telegram). Lo recuperiamo da telegram_users WHERE role='proprieta'.
+# Vincolo: Omar deve aver scritto almeno una volta in privato al bot perche'
+# il send_message funzioni (Telegram non permette di scrivere a chi non ha
+# mai iniziato la conversazione).
+#
+# Comando manuale /report_cassa: per testare senza aspettare le 20:00, o
+# per chiedere il report al volo. Solo proprieta/contabile.
+
+CAIRO_TZ_NAME = "Africa/Cairo"
+DAILY_REPORT_HOUR_CAIRO = 20  # 20:00 Cairo time
+SNAPSHOT_CASSA_CODE = "cassa_contabile"
+
+
+def _fetch_proprieta_user_id() -> int | None:
+    """Recupera il telegram_user_id dell'utente con role='proprieta' (Omar)."""
+    if not _sb_configured():
+        return None
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/telegram_users",
+            headers=_sb_headers(),
+            params={
+                "select": "telegram_user_id",
+                "role": "eq.proprieta",
+                "limit": "1",
+            },
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return None
+        rows = r.json()
+        return int(rows[0]["telegram_user_id"]) if rows else None
+    except Exception as e:
+        print(f"_fetch_proprieta_user_id error: {e}")
+        return None
+
+
+def _compute_cassa_snapshot(account_code: str, target_date_str: str) -> dict | None:
+    """Calcola lo snapshot di una cassa per una data specifica.
+
+    Ritorna dict con: apertura_eur, apertura_le, incassi_eur/le, uscite_eur/le,
+    trasferimenti_eur/le, chiusura_eur/le, n_movimenti.
+
+    Strategia: legge tutti i journal_lines di account_code via v_journal_lines
+    fino a target_date inclusa. Per le righe del giorno, recupera anche le
+    righe gemelle (stessa entry) per classificare incasso/uscita/trasferimento.
+    """
+    if not _sb_configured():
+        return None
+    try:
+        # 1. Fetch lines on this account up to target_date inclusive
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/v_journal_lines",
+            headers=_sb_headers(),
+            params={
+                "select": "entry_id,entry_date,description,account_code,dare,avere,currency",
+                "account_code": f"eq.{account_code}",
+                "entry_date": f"lte.{target_date_str}",
+                "order": "entry_date.asc",
+            },
+            timeout=15,
+        )
+        if r.status_code != 200:
+            print(f"_compute_cassa_snapshot fetch lines: {r.status_code}")
+            return None
+        lines = r.json()
+    except Exception as e:
+        print(f"_compute_cassa_snapshot error: {e}")
+        return None
+
+    # 2. Saldo apertura: somma di tutte le righe PRIMA del target_date
+    apertura_eur = 0.0
+    apertura_le = 0.0
+    today_lines: list[dict] = []
+    for ln in lines:
+        edate = str(ln.get("entry_date", ""))
+        dare = float(ln.get("dare") or 0)
+        avere = float(ln.get("avere") or 0)
+        curr = ln.get("currency", "EUR")
+        if edate < target_date_str:
+            if curr == "EUR":
+                apertura_eur += dare - avere
+            elif curr == "EGP":
+                apertura_le += dare - avere
+        elif edate == target_date_str:
+            today_lines.append(ln)
+
+    # 3. Per le linee del giorno, classifica via siblings
+    incassi_eur = incassi_le = 0.0
+    uscite_eur = uscite_le = 0.0
+    trasf_eur = trasf_le = 0.0
+
+    if today_lines:
+        entry_ids = list({ln["entry_id"] for ln in today_lines})
+        # PostgREST 'in' filter syntax: in.(uuid1,uuid2,...)
+        ids_str = ",".join(entry_ids)
+        try:
+            r2 = requests.get(
+                f"{SUPABASE_URL}/rest/v1/v_journal_lines",
+                headers=_sb_headers(),
+                params={
+                    "select": "entry_id,account_code,account_type,dare,avere,currency",
+                    "entry_id": f"in.({ids_str})",
+                },
+                timeout=15,
+            )
+            siblings_data = r2.json() if r2.status_code == 200 else []
+        except Exception as e:
+            print(f"_compute_cassa_snapshot siblings: {e}")
+            siblings_data = []
+
+        # Index siblings by entry_id (escludi la riga della cassa stessa)
+        siblings_by_entry: dict[str, list[dict]] = {}
+        for s in siblings_data:
+            if s["account_code"] != account_code:
+                siblings_by_entry.setdefault(s["entry_id"], []).append(s)
+
+        for ln in today_lines:
+            eid = ln["entry_id"]
+            sibs = siblings_by_entry.get(eid, [])
+            dare = float(ln.get("dare") or 0)
+            avere = float(ln.get("avere") or 0)
+            importo = dare - avere  # positivo = entrata cassa
+            curr = ln.get("currency", "EUR")
+
+            # Classifica in base al primo sibling significativo
+            tipo = "altro"
+            if sibs:
+                sib = sibs[0]
+                stype = sib.get("account_type", "")
+                scode = sib.get("account_code", "")
+                if stype == "ricavo":
+                    tipo = "incasso"
+                elif stype == "costo":
+                    tipo = "uscita"
+                elif scode.startswith("cassa_") or scode in ("proprieta", "banca"):
+                    tipo = "trasferimento"
+
+            if curr == "EUR":
+                if tipo == "incasso":
+                    incassi_eur += importo
+                elif tipo == "uscita":
+                    uscite_eur += abs(importo)
+                elif tipo == "trasferimento":
+                    trasf_eur += importo
+            elif curr == "EGP":
+                if tipo == "incasso":
+                    incassi_le += importo
+                elif tipo == "uscita":
+                    uscite_le += abs(importo)
+                elif tipo == "trasferimento":
+                    trasf_le += importo
+
+    chiusura_eur = apertura_eur + incassi_eur - uscite_eur + trasf_eur
+    chiusura_le = apertura_le + incassi_le - uscite_le + trasf_le
+
+    return {
+        "apertura_eur": apertura_eur,
+        "apertura_le": apertura_le,
+        "incassi_eur": incassi_eur,
+        "incassi_le": incassi_le,
+        "uscite_eur": uscite_eur,
+        "uscite_le": uscite_le,
+        "trasferimenti_eur": trasf_eur,
+        "trasferimenti_le": trasf_le,
+        "chiusura_eur": chiusura_eur,
+        "chiusura_le": chiusura_le,
+        "n_movimenti": len(today_lines),
+    }
+
+
+def _format_snapshot_text(snapshot: dict, target_date, cassa_label: str = "Cassa Contabile") -> str:
+    """Formatta lo snapshot come testo per Telegram."""
+    s = snapshot
+    delta_eur = s["chiusura_eur"] - s["apertura_eur"]
+    delta_le = s["chiusura_le"] - s["apertura_le"]
+
+    def _fmt_eur(v):
+        return f"€ {v:,.2f}"
+
+    def _fmt_le_opt(v):
+        return f" + {v:,.0f} LE" if abs(v) >= 0.5 else ""
+
+    lines = [
+        f"📊 Report {cassa_label}",
+        f"📅 {target_date.strftime('%A %d/%m/%Y')}",
+        "",
+        f"🟦 Apertura:  {_fmt_eur(s['apertura_eur'])}{_fmt_le_opt(s['apertura_le'])}",
+        f"📥 Incassi:   {_fmt_eur(s['incassi_eur'])}{_fmt_le_opt(s['incassi_le'])}",
+        f"📤 Uscite:    {_fmt_eur(s['uscite_eur'])}{_fmt_le_opt(s['uscite_le'])}",
+    ]
+    if abs(s["trasferimenti_eur"]) >= 0.01 or abs(s["trasferimenti_le"]) >= 0.5:
+        lines.append(
+            f"🔄 Trasf.:    € {s['trasferimenti_eur']:+,.2f}"
+            f"{_fmt_le_opt(s['trasferimenti_le'])}"
+        )
+    lines.extend([
+        "─────────────────────",
+        f"🟩 Chiusura:  {_fmt_eur(s['chiusura_eur'])}{_fmt_le_opt(s['chiusura_le'])}",
+        f"Δ vs apertura: € {delta_eur:+,.2f}{_fmt_le_opt(delta_le)}",
+        f"# movimenti:  {s['n_movimenti']}",
+    ])
+    if s["n_movimenti"] == 0:
+        lines.append("")
+        lines.append("(nessun movimento oggi — saldo invariato)")
+    return "\n".join(lines)
+
+
+async def send_daily_cash_report(context: ContextTypes.DEFAULT_TYPE):
+    """JOB SCHEDULATO: invia il report cassa contabile a Omar ogni sera.
+
+    Eseguito da JobQueue alle 20:00 ora del Cairo. NON manda al gruppo:
+    SOLO chat privata di Omar (telegram_user_id = chat_id privato col bot).
+    """
+    from datetime import date as _date
+    target_chat = _fetch_proprieta_user_id()
+    if not target_chat:
+        print("[daily_report] proprieta user non trovato in telegram_users → skip")
+        return
+
+    target_date = _date.today()  # data di esecuzione = oggi
+    snapshot = _compute_cassa_snapshot(
+        SNAPSHOT_CASSA_CODE, target_date.isoformat()
+    )
+    if snapshot is None:
+        print("[daily_report] errore calcolo snapshot → skip")
+        return
+
+    text = _format_snapshot_text(snapshot, target_date, "Cassa Contabile")
+    try:
+        await context.bot.send_message(chat_id=target_chat, text=text)
+        print(f"[daily_report] inviato a chat {target_chat}")
+    except Exception as e:
+        # Caso tipico: Omar non ha mai scritto in privato al bot
+        # ("Forbidden: bot can't initiate conversation with a user")
+        print(f"[daily_report] send a {target_chat} fallito: {e}")
+
+
+async def cmd_report_cassa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/report_cassa — invia lo snapshot di cassa_contabile al volo (per test
+    o per averlo prima delle 20:00). Solo proprieta/contabile.
+    """
+    tg_user = await _require_admin(update)
+    if not tg_user:
+        return
+    from datetime import date as _date
+    target_date = _date.today()
+    snapshot = _compute_cassa_snapshot(
+        SNAPSHOT_CASSA_CODE, target_date.isoformat()
+    )
+    if snapshot is None:
+        await update.message.reply_text(
+            "❌ Errore nel calcolare lo snapshot. Riprova fra poco."
+        )
+        return
+    text = _format_snapshot_text(snapshot, target_date, "Cassa Contabile")
+    await update.message.reply_text(text)
+
+
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/whoami — debug: shows how Omar/bot see this user."""
     upsert_telegram_user(update.effective_user)
@@ -1571,6 +1839,7 @@ ADMIN_COMMANDS = [
     BotCommand("raccolgo", "Incassa soldi da una guida"),
     BotCommand("verso", "Versa soldi a proprieta o banca"),
     BotCommand("paga_fornitore", "Registra pagamento fornitore (Shamandura, ecc.)"),
+    BotCommand("report_cassa", "Snapshot cassa contabile di oggi"),
     BotCommand("whoami", "Vedi chi sei nel sistema"),
 ]
 
@@ -1657,6 +1926,7 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("raccolgo", cmd_raccolgo))
     app.add_handler(CommandHandler("verso", cmd_verso))
+    app.add_handler(CommandHandler("report_cassa", cmd_report_cassa))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
 
     # /paga_fornitore — flow conversazionale (entry → step → confirm).
@@ -1677,6 +1947,34 @@ def main():
         per_chat=True,
     )
     app.add_handler(paga_fornitore_conv)
+
+    # ─────────────────────────────────────────────────────────────────
+    # JobQueue: schedule daily cash report alle 20:00 ora del Cairo,
+    # invio in chat PRIVATA al proprieta (Omar). Richiede l'extra
+    # `python-telegram-bot[job-queue]` in requirements.txt (installa
+    # APScheduler sotto il cofano).
+    # ─────────────────────────────────────────────────────────────────
+    try:
+        from datetime import time as _time
+        from zoneinfo import ZoneInfo
+        job_queue = app.job_queue
+        if job_queue is None:
+            print("⚠️ JobQueue non disponibile: installa python-telegram-bot[job-queue]")
+        else:
+            job_queue.run_daily(
+                send_daily_cash_report,
+                time=_time(
+                    hour=DAILY_REPORT_HOUR_CAIRO, minute=0,
+                    tzinfo=ZoneInfo(CAIRO_TZ_NAME),
+                ),
+                name="daily_cash_report",
+            )
+            print(
+                f"📅 Report cassa contabile schedulato ogni giorno alle "
+                f"{DAILY_REPORT_HOUR_CAIRO:02d}:00 ({CAIRO_TZ_NAME})"
+            )
+    except Exception as e:
+        print(f"⚠️ Errore setup daily report job: {e}")
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.run_polling()

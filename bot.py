@@ -1786,6 +1786,24 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # --- Manager: stessa cosa di guida ma label diversa (richiesta Omar
+    # 27/04/2026 — ruolo cosmetico per riconoscimento gerarchico,
+    # funzionalmente identico a guida).
+    if role == "manager":
+        await update.message.reply_text(
+            f"👋 Ciao {display_name}! Sei registrato come *manager*.\n\n"
+            "*Come registrare un evento:*\n"
+            "`+200 tour piramidi` → incasso in euro\n"
+            "`+500 EGP commissione` → incasso in lire egiziane\n"
+            "`-50 cammello` → spesa in euro\n"
+            "`-1000 LE biglietto museo` → spesa in lire\n\n"
+            "Quando passi i soldi ad Amr, lui scrive /raccolgo dalla sua parte "
+            "e i tuoi saldi si aggiornano da soli.\n\n"
+            "🔎 /whoami — controlla il tuo stato",
+            parse_mode="Markdown",
+        )
+        return
+
     # --- Proprieta (Omar): can do both (logs economic events AND sees all) ---
     if role == "proprieta":
         await update.message.reply_text(

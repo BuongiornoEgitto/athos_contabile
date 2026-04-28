@@ -278,6 +278,46 @@ def find_guida_by_name(name: str) -> dict | None:
     return None
 
 
+def fetch_active_guide() -> list[dict]:
+    """All guide with role='guida' and account_code assigned, sorted by name."""
+    if not _sb_configured():
+        return []
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/telegram_users"
+            f"?role=eq.guida&account_code=not.is.null"
+            f"&select=display_name,account_code"
+            f"&order=display_name.asc",
+            headers=_sb_headers(),
+            timeout=10,
+        )
+        if r.status_code == 200:
+            return r.json() or []
+        print(f"fetch_active_guide: {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        print(f"fetch_active_guide error: {e}")
+    return []
+
+
+def find_guida_by_account_code(account_code: str) -> dict | None:
+    """Lookup a guida by account_code (used to complete /raccolgo via inline button)."""
+    if not _sb_configured() or not account_code:
+        return None
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/telegram_users"
+            f"?role=eq.guida&account_code=eq.{account_code}&select=*",
+            headers=_sb_headers(),
+            timeout=10,
+        )
+        if r.status_code == 200:
+            rows = r.json()
+            return rows[0] if rows else None
+    except Exception as e:
+        print(f"find_guida_by_account_code error: {e}")
+    return None
+
+
 def insert_journal_entry(
     description: str,
     source: str,
@@ -1070,8 +1110,35 @@ async def _require_admin(update: Update):
     return tg_user
 
 
+def _do_raccolgo(
+    importo: float,
+    guida: dict,
+    receiver_account: str,
+    receiver_name: str,
+    telegram_user_id: int,
+) -> tuple[bool, str]:
+    """Insert the balanced journal entry for /raccolgo. Returns (ok, message)."""
+    entry_id = insert_journal_entry(
+        description=f"Raccolta da {guida['display_name']} (a {receiver_name})",
+        source="telegram",
+        telegram_user_id=telegram_user_id,
+        lines=[
+            {"account_code": receiver_account,
+             "dare": importo, "avere": 0, "currency": "EUR"},
+            {"account_code": guida["account_code"],
+             "dare": 0, "avere": importo, "currency": "EUR"},
+        ],
+    )
+    if not entry_id:
+        return False, "❌ Errore nel registrare. Riprova."
+    return True, (
+        f"✅ Raccolto €{importo:.2f} da {guida['display_name']}\n\n"
+        f"I soldi sono ora in {receiver_account} ({receiver_name})."
+    )
+
+
 async def cmd_raccolgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/raccolgo <importo> <guida>  — es. /raccolgo 200 saif
+    """/raccolgo <importo> [guida]  — es. /raccolgo 200 saif | /raccolgo 200
 
     Scrittura:
       dare  <conto di chi raccoglie>  <importo>
@@ -1080,6 +1147,9 @@ async def cmd_raccolgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Il conto mittente e' preso dall'account_code dell'utente che scrive:
       - contabile → cassa_contabile
       - proprieta → proprieta
+
+    Se il nome guida manca, mostra una tastiera inline con tutte le guide
+    attive (con account_code assegnato).
     """
     tg_user = await _require_admin(update)
     if not tg_user:
@@ -1089,10 +1159,12 @@ async def cmd_raccolgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     receiver_name = tg_user.get("display_name") or "admin"
 
     args = context.args
-    if len(args) < 2:
+    if len(args) == 0:
         await update.message.reply_text(
-            "ℹ️ Uso: `/raccolgo <importo> <nome_guida>`\n"
-            "Es: `/raccolgo 200 saif`",
+            "ℹ️ Uso:\n"
+            "• `/raccolgo <importo>` — scegli la guida da una lista\n"
+            "• `/raccolgo <importo> <nome_guida>` — diretto\n\n"
+            "Es: `/raccolgo 200` oppure `/raccolgo 200 saif`",
             parse_mode="Markdown",
         )
         return
@@ -1104,6 +1176,38 @@ async def cmd_raccolgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if importo <= 0:
         await update.message.reply_text("❌ L'importo deve essere maggiore di zero.")
+        return
+
+    if len(args) == 1:
+        guide = fetch_active_guide()
+        if not guide:
+            await update.message.reply_text(
+                "❌ Nessuna guida con conto assegnato. Registra prima una guida."
+            )
+            return
+        keyboard = []
+        for i in range(0, len(guide), 2):
+            row = [
+                InlineKeyboardButton(
+                    guide[i]["display_name"],
+                    callback_data=f"racc:{importo:.2f}:{guide[i]['account_code']}",
+                )
+            ]
+            if i + 1 < len(guide):
+                row.append(
+                    InlineKeyboardButton(
+                        guide[i + 1]["display_name"],
+                        callback_data=f"racc:{importo:.2f}:{guide[i + 1]['account_code']}",
+                    )
+                )
+            keyboard.append(row)
+        keyboard.append([
+            InlineKeyboardButton("❌ Annulla", callback_data="racc_cancel")
+        ])
+        await update.message.reply_text(
+            f"💰 Raccogli €{importo:.2f}\n\nDa quale guida?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
         return
 
     guida_name = " ".join(args[1:]).strip()
@@ -1120,26 +1224,55 @@ async def cmd_raccolgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    entry_id = insert_journal_entry(
-        description=f"Raccolta da {guida['display_name']} (a {receiver_name})",
-        source="telegram",
-        telegram_user_id=update.effective_user.id,
-        lines=[
-            {"account_code": receiver_account,
-             "dare": importo, "avere": 0, "currency": "EUR"},
-            {"account_code": guida["account_code"],
-             "dare": 0, "avere": importo, "currency": "EUR"},
-        ],
+    ok, msg = _do_raccolgo(
+        importo, guida, receiver_account, receiver_name, update.effective_user.id
     )
-    if not entry_id:
-        await update.message.reply_text("❌ Errore nel registrare. Riprova.")
+    # No parse_mode — account codes contain underscores che rompono il Markdown.
+    await update.message.reply_text(msg)
+
+
+async def racc_on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback handler per la tastiera di /raccolgo: completa la raccolta."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+
+    if data == "racc_cancel":
+        await query.edit_message_text("❌ Raccolta annullata.")
         return
 
-    # No parse_mode — account codes contain underscores che rompono il Markdown.
-    await update.message.reply_text(
-        f"✅ Raccolto €{importo:.2f} da {guida['display_name']}\n\n"
-        f"I soldi sono ora in {receiver_account} ({receiver_name})."
+    if not data.startswith("racc:"):
+        return
+
+    # Re-check permessi: solo contabile/proprieta con account_code possono raccogliere.
+    tg_user = get_telegram_user(update.effective_user.id)
+    if (
+        not tg_user
+        or not tg_user.get("account_code")
+        or tg_user.get("role") not in ("contabile", "proprieta")
+    ):
+        await query.edit_message_text("🚫 Non sei autorizzato a raccogliere.")
+        return
+
+    receiver_account = tg_user["account_code"]
+    receiver_name = tg_user.get("display_name") or "admin"
+
+    try:
+        _, importo_str, account_code = data.split(":", 2)
+        importo = float(importo_str)
+    except (ValueError, IndexError):
+        await query.edit_message_text("❌ Errore nel callback.")
+        return
+
+    guida = find_guida_by_account_code(account_code)
+    if not guida or not guida.get("account_code"):
+        await query.edit_message_text("❌ Guida non trovata.")
+        return
+
+    ok, msg = _do_raccolgo(
+        importo, guida, receiver_account, receiver_name, update.effective_user.id
     )
+    await query.edit_message_text(msg)
 
 
 async def cmd_verso(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2020,6 +2153,7 @@ def main():
     )
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("raccolgo", cmd_raccolgo))
+    app.add_handler(CallbackQueryHandler(racc_on_callback, pattern=r"^racc[:_]"))
     app.add_handler(CommandHandler("verso", cmd_verso))
     app.add_handler(CommandHandler("report_cassa", cmd_report_cassa))
     app.add_handler(CommandHandler("whoami", cmd_whoami))

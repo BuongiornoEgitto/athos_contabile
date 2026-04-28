@@ -1137,8 +1137,52 @@ def _do_raccolgo(
     )
 
 
+async def _send_guide_keyboard(message, importo: float) -> bool:
+    """Show the inline keyboard with all active guide. Returns True if shown,
+    False if no guide are available (in that case sends an error message)."""
+    guide = fetch_active_guide()
+    if not guide:
+        await message.reply_text(
+            "❌ Nessuna guida con conto assegnato. Registra prima una guida."
+        )
+        return False
+    keyboard = []
+    for i in range(0, len(guide), 2):
+        row = [
+            InlineKeyboardButton(
+                guide[i]["display_name"],
+                callback_data=f"racc:{importo:.2f}:{guide[i]['account_code']}",
+            )
+        ]
+        if i + 1 < len(guide):
+            row.append(
+                InlineKeyboardButton(
+                    guide[i + 1]["display_name"],
+                    callback_data=f"racc:{importo:.2f}:{guide[i + 1]['account_code']}",
+                )
+            )
+        keyboard.append(row)
+    keyboard.append([
+        InlineKeyboardButton("❌ Annulla", callback_data="racc_cancel")
+    ])
+    await message.reply_text(
+        f"💰 Raccogli €{importo:.2f}\n\nDa quale guida?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return True
+
+
 async def cmd_raccolgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/raccolgo <importo> [guida]  — es. /raccolgo 200 saif | /raccolgo 200
+    """/raccolgo [importo] [guida]  — flow entry point.
+
+    Tre modalita':
+      - /raccolgo                 → chiede importo, poi mostra lista guide
+      - /raccolgo 200             → mostra subito la lista guide
+      - /raccolgo 200 saif        → diretto (no tastiera, no flow)
+
+    Telegram in chat invia il comando subito quando lo selezioni
+    dall'autocomplete: per questo /raccolgo da solo entra in un flow
+    conversazionale (chiede l'importo come messaggio).
 
     Scrittura:
       dare  <conto di chi raccoglie>  <importo>
@@ -1147,13 +1191,10 @@ async def cmd_raccolgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Il conto mittente e' preso dall'account_code dell'utente che scrive:
       - contabile → cassa_contabile
       - proprieta → proprieta
-
-    Se il nome guida manca, mostra una tastiera inline con tutte le guide
-    attive (con account_code assegnato).
     """
     tg_user = await _require_admin(update)
     if not tg_user:
-        return
+        return ConversationHandler.END
 
     receiver_account = tg_user["account_code"]
     receiver_name = tg_user.get("display_name") or "admin"
@@ -1161,54 +1202,24 @@ async def cmd_raccolgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) == 0:
         await update.message.reply_text(
-            "ℹ️ Uso:\n"
-            "• `/raccolgo <importo>` — scegli la guida da una lista\n"
-            "• `/raccolgo <importo> <nome_guida>` — diretto\n\n"
-            "Es: `/raccolgo 200` oppure `/raccolgo 200 saif`",
-            parse_mode="Markdown",
+            "💰 Quanto stai raccogliendo (€)?\n"
+            "Scrivi solo il numero, es. 200.\n\n"
+            "(Annulla con /annulla)"
         )
-        return
+        return RACC_AMOUNT
 
     try:
         importo = float(args[0].replace(",", "."))
     except ValueError:
         await update.message.reply_text(f"❌ '{args[0]}' non è un numero valido.")
-        return
+        return ConversationHandler.END
     if importo <= 0:
         await update.message.reply_text("❌ L'importo deve essere maggiore di zero.")
-        return
+        return ConversationHandler.END
 
     if len(args) == 1:
-        guide = fetch_active_guide()
-        if not guide:
-            await update.message.reply_text(
-                "❌ Nessuna guida con conto assegnato. Registra prima una guida."
-            )
-            return
-        keyboard = []
-        for i in range(0, len(guide), 2):
-            row = [
-                InlineKeyboardButton(
-                    guide[i]["display_name"],
-                    callback_data=f"racc:{importo:.2f}:{guide[i]['account_code']}",
-                )
-            ]
-            if i + 1 < len(guide):
-                row.append(
-                    InlineKeyboardButton(
-                        guide[i + 1]["display_name"],
-                        callback_data=f"racc:{importo:.2f}:{guide[i + 1]['account_code']}",
-                    )
-                )
-            keyboard.append(row)
-        keyboard.append([
-            InlineKeyboardButton("❌ Annulla", callback_data="racc_cancel")
-        ])
-        await update.message.reply_text(
-            f"💰 Raccogli €{importo:.2f}\n\nDa quale guida?",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-        )
-        return
+        await _send_guide_keyboard(update.message, importo)
+        return ConversationHandler.END
 
     guida_name = " ".join(args[1:]).strip()
     guida = find_guida_by_name(guida_name)
@@ -1217,18 +1228,43 @@ async def cmd_raccolgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"❌ Guida '{guida_name}' non trovata.\n"
             f"Deve prima scrivere un messaggio al bot e essere registrata da Omar."
         )
-        return
+        return ConversationHandler.END
     if not guida.get("account_code"):
         await update.message.reply_text(
             f"❌ {guida['display_name']} è registrata ma non ha ancora un conto assegnato."
         )
-        return
+        return ConversationHandler.END
 
     ok, msg = _do_raccolgo(
         importo, guida, receiver_account, receiver_name, update.effective_user.id
     )
     # No parse_mode — account codes contain underscores che rompono il Markdown.
     await update.message.reply_text(msg)
+    return ConversationHandler.END
+
+
+async def racc_on_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 2 del flow: l'utente ha scritto l'importo come messaggio."""
+    text = (update.message.text or "").strip().replace(",", ".")
+    try:
+        importo = float(text)
+    except ValueError:
+        await update.message.reply_text(
+            f"❌ '{text}' non è un numero valido. Riprova (solo il numero, es. 200)."
+        )
+        return RACC_AMOUNT
+    if importo <= 0:
+        await update.message.reply_text("❌ L'importo deve essere maggiore di zero. Riprova.")
+        return RACC_AMOUNT
+
+    await _send_guide_keyboard(update.message, importo)
+    return ConversationHandler.END
+
+
+async def racc_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fallback /annulla per il flow di /raccolgo."""
+    await update.message.reply_text("❌ Raccolta annullata.")
+    return ConversationHandler.END
 
 
 async def racc_on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1384,6 +1420,7 @@ async def cmd_verso(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Stati del ConversationHandler
 PAY_SUPPLIER, PAY_AMOUNT, PAY_CASSA, PAY_CONFIRM = range(4)
+RACC_AMOUNT = 10  # Stato per /raccolgo (separato dai PAY_*)
 
 # Lista fornitori (code → label). Hardcoded perche':
 # - cambia raramente (nuovo fornitore = side-task migration + redeploy bot)
@@ -2152,8 +2189,23 @@ def main():
         .build()
     )
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("raccolgo", cmd_raccolgo))
+
+    # /raccolgo — flow conversazionale (entry → optional amount → keyboard).
+    # Va REGISTRATO PRIMA del MessageHandler globale, altrimenti il numero
+    # scritto dopo "Quanto raccogli?" verrebbe intercettato da handle_message
+    # e interpretato come transazione libera.
+    raccolgo_conv = ConversationHandler(
+        entry_points=[CommandHandler("raccolgo", cmd_raccolgo)],
+        states={
+            RACC_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, racc_on_amount)],
+        },
+        fallbacks=[CommandHandler("annulla", racc_cancel)],
+        per_user=True,
+        per_chat=True,
+    )
+    app.add_handler(raccolgo_conv)
     app.add_handler(CallbackQueryHandler(racc_on_callback, pattern=r"^racc[:_]"))
+
     app.add_handler(CommandHandler("verso", cmd_verso))
     app.add_handler(CommandHandler("report_cassa", cmd_report_cassa))
     app.add_handler(CommandHandler("whoami", cmd_whoami))

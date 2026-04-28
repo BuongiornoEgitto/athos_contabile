@@ -258,55 +258,63 @@ def get_telegram_user(user_id: int) -> dict | None:
     return None
 
 
-def find_guida_by_name(name: str) -> dict | None:
-    """Case-insensitive lookup of a guida by display_name (used by /raccolgo)."""
+def find_user_by_name(name: str) -> dict | None:
+    """Case-insensitive lookup of a telegram_user by display_name (any role).
+    Used by /raccolgo and /verso when the user types the name directly."""
     if not _sb_configured() or not name:
         return None
     try:
         r = requests.get(
             f"{SUPABASE_URL}/rest/v1/telegram_users"
-            f"?role=eq.guida&display_name=ilike.{name}&select=*",
+            f"?display_name=ilike.{name}&account_code=not.is.null&select=*",
             headers=_sb_headers(),
             timeout=10,
         )
         if r.status_code == 200:
             rows = r.json()
             return rows[0] if rows else None
-        print(f"find_guida_by_name: {r.status_code} {r.text[:200]}")
+        print(f"find_user_by_name: {r.status_code} {r.text[:200]}")
     except Exception as e:
-        print(f"find_guida_by_name error: {e}")
+        print(f"find_user_by_name error: {e}")
     return None
 
 
-def fetch_active_guide() -> list[dict]:
-    """All guide with role='guida' and account_code assigned, sorted by name."""
+def fetch_users_with_account(exclude_account: str | None = None) -> list[dict]:
+    """All telegram_users (guida/manager/contabile/proprieta) with an
+    account_code assigned, alphabetically. Optionally excludes a single
+    account_code (typically the caller, who can't /raccolgo or /verso to self).
+    """
     if not _sb_configured():
         return []
     try:
         r = requests.get(
             f"{SUPABASE_URL}/rest/v1/telegram_users"
-            f"?role=eq.guida&account_code=not.is.null"
-            f"&select=display_name,account_code"
+            f"?account_code=not.is.null"
+            f"&role=in.(guida,manager,contabile,proprieta)"
+            f"&select=display_name,account_code,role"
             f"&order=display_name.asc",
             headers=_sb_headers(),
             timeout=10,
         )
         if r.status_code == 200:
-            return r.json() or []
-        print(f"fetch_active_guide: {r.status_code} {r.text[:200]}")
+            rows = r.json() or []
+            if exclude_account:
+                rows = [u for u in rows if u.get("account_code") != exclude_account]
+            return rows
+        print(f"fetch_users_with_account: {r.status_code} {r.text[:200]}")
     except Exception as e:
-        print(f"fetch_active_guide error: {e}")
+        print(f"fetch_users_with_account error: {e}")
     return []
 
 
-def find_guida_by_account_code(account_code: str) -> dict | None:
-    """Lookup a guida by account_code (used to complete /raccolgo via inline button)."""
+def find_user_by_account_code(account_code: str) -> dict | None:
+    """Lookup any telegram_user by account_code (used by inline-button callbacks)."""
     if not _sb_configured() or not account_code:
         return None
     try:
         r = requests.get(
             f"{SUPABASE_URL}/rest/v1/telegram_users"
-            f"?role=eq.guida&account_code=eq.{account_code}&select=*",
+            f"?account_code=eq.{account_code}&select=*",
             headers=_sb_headers(),
             timeout=10,
         )
@@ -314,8 +322,21 @@ def find_guida_by_account_code(account_code: str) -> dict | None:
             rows = r.json()
             return rows[0] if rows else None
     except Exception as e:
-        print(f"find_guida_by_account_code error: {e}")
+        print(f"find_user_by_account_code error: {e}")
     return None
+
+
+def _user_button_label(user: dict) -> str:
+    """Inline-button label with a role-emoji prefix to distinguish at a glance."""
+    role = user.get("role")
+    name = user.get("display_name") or "?"
+    emoji = {
+        "proprieta": "🏠",
+        "contabile": "🧮",
+        "manager":   "👔",
+        "guida":     "🧭",
+    }.get(role, "👤")
+    return f"{emoji} {name}"
 
 
 def insert_journal_entry(
@@ -1112,72 +1133,85 @@ async def _require_admin(update: Update):
 
 def _do_raccolgo(
     importo: float,
-    guida: dict,
+    sender: dict,
     receiver_account: str,
     receiver_name: str,
     telegram_user_id: int,
 ) -> tuple[bool, str]:
-    """Insert the balanced journal entry for /raccolgo. Returns (ok, message)."""
+    """Insert the balanced journal entry for /raccolgo. The 'sender' is the
+    telegram_user the money is collected FROM (any role with account_code)."""
     entry_id = insert_journal_entry(
-        description=f"Raccolta da {guida['display_name']} (a {receiver_name})",
+        description=f"Raccolta da {sender['display_name']} (a {receiver_name})",
         source="telegram",
         telegram_user_id=telegram_user_id,
         lines=[
             {"account_code": receiver_account,
              "dare": importo, "avere": 0, "currency": "EUR"},
-            {"account_code": guida["account_code"],
+            {"account_code": sender["account_code"],
              "dare": 0, "avere": importo, "currency": "EUR"},
         ],
     )
     if not entry_id:
         return False, "❌ Errore nel registrare. Riprova."
     return True, (
-        f"✅ Raccolto €{importo:.2f} da {guida['display_name']}\n\n"
+        f"✅ Raccolto €{importo:.2f} da {sender['display_name']}\n\n"
         f"I soldi sono ora in {receiver_account} ({receiver_name})."
     )
 
 
-async def _send_guide_keyboard(message, importo: float) -> bool:
-    """Show the inline keyboard with all active guide. Returns True if shown,
-    False if no guide are available (in that case sends an error message)."""
-    guide = fetch_active_guide()
-    if not guide:
-        await message.reply_text(
-            "❌ Nessuna guida con conto assegnato. Registra prima una guida."
-        )
+async def _send_user_keyboard(
+    message,
+    importo: float,
+    *,
+    callback_prefix: str,                  # "racc" | "verso"
+    cancel_data: str,                      # "racc_cancel" | "verso_cancel"
+    title: str,                            # heading shown above the keyboard
+    question: str,                         # prompt below the heading
+    exclude_account: str | None = None,
+    extra_buttons: list[InlineKeyboardButton] | None = None,
+) -> bool:
+    """Render an inline keyboard with all telegram_users having an account_code.
+    Optionally appends extra buttons (e.g. '🏦 Banca' for /verso) and an Annulla.
+    Returns True if at least one option was shown, False otherwise."""
+    users = fetch_users_with_account(exclude_account=exclude_account)
+    if not users and not extra_buttons:
+        await message.reply_text("❌ Nessun utente disponibile con conto assegnato.")
         return False
     keyboard = []
-    for i in range(0, len(guide), 2):
+    for i in range(0, len(users), 2):
         row = [
             InlineKeyboardButton(
-                guide[i]["display_name"],
-                callback_data=f"racc:{importo:.2f}:{guide[i]['account_code']}",
+                _user_button_label(users[i]),
+                callback_data=f"{callback_prefix}:{importo:.2f}:{users[i]['account_code']}",
             )
         ]
-        if i + 1 < len(guide):
+        if i + 1 < len(users):
             row.append(
                 InlineKeyboardButton(
-                    guide[i + 1]["display_name"],
-                    callback_data=f"racc:{importo:.2f}:{guide[i + 1]['account_code']}",
+                    _user_button_label(users[i + 1]),
+                    callback_data=f"{callback_prefix}:{importo:.2f}:{users[i + 1]['account_code']}",
                 )
             )
         keyboard.append(row)
+    if extra_buttons:
+        for btn in extra_buttons:
+            keyboard.append([btn])
     keyboard.append([
-        InlineKeyboardButton("❌ Annulla", callback_data="racc_cancel")
+        InlineKeyboardButton("❌ Annulla", callback_data=cancel_data)
     ])
     await message.reply_text(
-        f"💰 Raccogli €{importo:.2f}\n\nDa quale guida?",
+        f"{title}\n\n{question}",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
     return True
 
 
 async def cmd_raccolgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/raccolgo [importo] [guida]  — flow entry point.
+    """/raccolgo [importo] [da_chi]  — flow entry point.
 
     Tre modalita':
-      - /raccolgo                 → chiede importo, poi mostra lista guide
-      - /raccolgo 200             → mostra subito la lista guide
+      - /raccolgo                 → chiede importo, poi mostra lista utenti
+      - /raccolgo 200             → mostra subito la lista utenti
       - /raccolgo 200 saif        → diretto (no tastiera, no flow)
 
     Telegram in chat invia il comando subito quando lo selezioni
@@ -1186,11 +1220,11 @@ async def cmd_raccolgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     Scrittura:
       dare  <conto di chi raccoglie>  <importo>
-      avere cassa_guida_<guida>       <importo>
+      avere <conto di chi consegna>   <importo>
 
-    Il conto mittente e' preso dall'account_code dell'utente che scrive:
-      - contabile → cassa_contabile
-      - proprieta → proprieta
+    Il conto destinatario e' preso dall'account_code dell'utente che scrive
+    il comando. Si puo' raccogliere da qualsiasi utente con account_code
+    (guida, manager, contabile, proprieta) — esclusi se' stessi.
     """
     tg_user = await _require_admin(update)
     if not tg_user:
@@ -1218,25 +1252,35 @@ async def cmd_raccolgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     if len(args) == 1:
-        await _send_guide_keyboard(update.message, importo)
+        await _send_user_keyboard(
+            update.message, importo,
+            callback_prefix="racc",
+            cancel_data="racc_cancel",
+            title=f"💰 Raccogli €{importo:.2f}",
+            question="Da chi?",
+            exclude_account=receiver_account,
+        )
         return ConversationHandler.END
 
-    guida_name = " ".join(args[1:]).strip()
-    guida = find_guida_by_name(guida_name)
-    if not guida:
+    sender_name = " ".join(args[1:]).strip()
+    sender = find_user_by_name(sender_name)
+    if not sender:
         await update.message.reply_text(
-            f"❌ Guida '{guida_name}' non trovata.\n"
-            f"Deve prima scrivere un messaggio al bot e essere registrata da Omar."
+            f"❌ '{sender_name}' non trovato/a.\n"
+            f"Deve prima scrivere un messaggio al bot e essere registrato/a da Omar."
         )
         return ConversationHandler.END
-    if not guida.get("account_code"):
+    if not sender.get("account_code"):
         await update.message.reply_text(
-            f"❌ {guida['display_name']} è registrata ma non ha ancora un conto assegnato."
+            f"❌ {sender['display_name']} è registrato/a ma non ha ancora un conto assegnato."
         )
+        return ConversationHandler.END
+    if sender["account_code"] == receiver_account:
+        await update.message.reply_text("❌ Non puoi raccogliere da te stesso.")
         return ConversationHandler.END
 
     ok, msg = _do_raccolgo(
-        importo, guida, receiver_account, receiver_name, update.effective_user.id
+        importo, sender, receiver_account, receiver_name, update.effective_user.id
     )
     # No parse_mode — account codes contain underscores che rompono il Markdown.
     await update.message.reply_text(msg)
@@ -1245,6 +1289,10 @@ async def cmd_raccolgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def racc_on_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Step 2 del flow: l'utente ha scritto l'importo come messaggio."""
+    tg_user = await _require_admin(update)
+    if not tg_user:
+        return ConversationHandler.END
+
     text = (update.message.text or "").strip().replace(",", ".")
     try:
         importo = float(text)
@@ -1257,7 +1305,14 @@ async def racc_on_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ L'importo deve essere maggiore di zero. Riprova.")
         return RACC_AMOUNT
 
-    await _send_guide_keyboard(update.message, importo)
+    await _send_user_keyboard(
+        update.message, importo,
+        callback_prefix="racc",
+        cancel_data="racc_cancel",
+        title=f"💰 Raccogli €{importo:.2f}",
+        question="Da chi?",
+        exclude_account=tg_user["account_code"],
+    )
     return ConversationHandler.END
 
 
@@ -1300,84 +1355,34 @@ async def racc_on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Errore nel callback.")
         return
 
-    guida = find_guida_by_account_code(account_code)
-    if not guida or not guida.get("account_code"):
-        await query.edit_message_text("❌ Guida non trovata.")
+    if account_code == receiver_account:
+        await query.edit_message_text("❌ Non puoi raccogliere da te stesso.")
+        return
+
+    sender = find_user_by_account_code(account_code)
+    if not sender or not sender.get("account_code"):
+        await query.edit_message_text("❌ Utente non trovato.")
         return
 
     ok, msg = _do_raccolgo(
-        importo, guida, receiver_account, receiver_name, update.effective_user.id
+        importo, sender, receiver_account, receiver_name, update.effective_user.id
     )
     await query.edit_message_text(msg)
 
 
-async def cmd_verso(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/verso <importo> <destinazione>  — es. /verso 2000 omar | /verso 500 banca
-
-    Scrittura:
-      dare  <destinazione>         <importo>
-      avere <conto di chi versa>   <importo>
-
-    Il conto mittente e' preso dall'account_code dell'utente che scrive:
-      - contabile → cassa_contabile
-      - proprieta → proprieta
-    Un admin non puo' versare a se stesso (no-op contabile).
-    """
-    tg_user = await _require_admin(update)
-    if not tg_user:
-        return
-
-    sender_account = tg_user["account_code"]
-    sender_name = tg_user.get("display_name") or "admin"
-
-    args = context.args
-    if len(args) < 2:
-        await update.message.reply_text(
-            "ℹ️ Uso: `/verso <importo> <destinazione>`\n"
-            "Destinazioni: `omar` (o `proprieta`), `banca`\n"
-            "Es: `/verso 2000 omar`",
-            parse_mode="Markdown",
-        )
-        return
-
-    try:
-        importo = float(args[0].replace(",", "."))
-    except ValueError:
-        await update.message.reply_text(f"❌ '{args[0]}' non è un numero valido.")
-        return
-    if importo <= 0:
-        await update.message.reply_text("❌ L'importo deve essere maggiore di zero.")
-        return
-
-    dest_raw = args[1].strip().lower()
-    dest_map = {
-        "omar": "proprieta",
-        "proprieta": "proprieta",
-        "proprietà": "proprieta",
-        "banca": "banca",
-        "bank": "banca",
-    }
-    dest_account = dest_map.get(dest_raw)
-    if not dest_account:
-        # No parse_mode — user input (dest_raw) could contain underscores.
-        await update.message.reply_text(
-            f"❌ Destinazione '{dest_raw}' non valida.\n"
-            f"Usa: omar, proprieta, o banca."
-        )
-        return
-
-    # Omar che versa a proprieta (cioe' a se stesso) e' un no-op: blocca.
-    if dest_account == sender_account:
-        await update.message.reply_text(
-            f"❌ Non puoi versare da {sender_account} a se stesso.\n"
-            f"Se vuoi spostare soldi, scegli una destinazione diversa (es. banca)."
-        )
-        return
-
+def _do_verso(
+    importo: float,
+    dest_account: str,
+    dest_label: str,
+    sender_account: str,
+    sender_name: str,
+    telegram_user_id: int,
+) -> tuple[bool, str]:
+    """Insert the balanced journal entry for /verso. Returns (ok, message)."""
     entry_id = insert_journal_entry(
-        description=f"Versamento a {dest_account} (da {sender_name})",
+        description=f"Versamento a {dest_label} (da {sender_name})",
         source="telegram",
-        telegram_user_id=update.effective_user.id,
+        telegram_user_id=telegram_user_id,
         lines=[
             {"account_code": dest_account,
              "dare": importo, "avere": 0, "currency": "EUR"},
@@ -1386,14 +1391,192 @@ async def cmd_verso(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
     )
     if not entry_id:
-        await update.message.reply_text("❌ Errore nel registrare. Riprova.")
-        return
-
-    # No parse_mode — account codes contain underscores.
-    await update.message.reply_text(
-        f"✅ Versati €{importo:.2f} a {dest_account}\n\n"
+        return False, "❌ Errore nel registrare. Riprova."
+    return True, (
+        f"✅ Versati €{importo:.2f} a {dest_label}\n\n"
         f"{sender_account} ({sender_name}) aggiornato."
     )
+
+
+async def _send_verso_keyboard(message, importo: float, exclude_account: str) -> bool:
+    """Tastiera per /verso: lista utenti + bottone 'Banca' come extra."""
+    bank_btn = InlineKeyboardButton(
+        "🏦 Banca",
+        callback_data=f"verso:{importo:.2f}:{BANK_ACCOUNT}",
+    )
+    return await _send_user_keyboard(
+        message, importo,
+        callback_prefix="verso",
+        cancel_data="verso_cancel",
+        title=f"💸 Versa €{importo:.2f}",
+        question="A chi?",
+        exclude_account=exclude_account,
+        extra_buttons=[bank_btn],
+    )
+
+
+async def cmd_verso(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/verso [importo] [destinazione]  — flow entry point.
+
+    Tre modalita':
+      - /verso                    → chiede importo, poi mostra lista
+      - /verso 2000               → mostra subito la lista (utenti + banca)
+      - /verso 2000 omar          → diretto (no tastiera, no flow)
+      - /verso 500 banca          → diretto a banca
+
+    Scrittura:
+      dare  <destinazione>         <importo>
+      avere <conto di chi versa>   <importo>
+
+    Il conto mittente e' preso dall'account_code dell'utente che scrive
+    il comando. Si puo' versare a qualsiasi utente con account_code o a
+    'banca' — escluso se' stessi.
+    """
+    tg_user = await _require_admin(update)
+    if not tg_user:
+        return ConversationHandler.END
+
+    sender_account = tg_user["account_code"]
+    sender_name = tg_user.get("display_name") or "admin"
+
+    args = context.args
+    if len(args) == 0:
+        await update.message.reply_text(
+            "💸 Quanto stai versando (€)?\n"
+            "Scrivi solo il numero, es. 2000.\n\n"
+            "(Annulla con /annulla)"
+        )
+        return VERSO_AMOUNT
+
+    try:
+        importo = float(args[0].replace(",", "."))
+    except ValueError:
+        await update.message.reply_text(f"❌ '{args[0]}' non è un numero valido.")
+        return ConversationHandler.END
+    if importo <= 0:
+        await update.message.reply_text("❌ L'importo deve essere maggiore di zero.")
+        return ConversationHandler.END
+
+    if len(args) == 1:
+        await _send_verso_keyboard(update.message, importo, sender_account)
+        return ConversationHandler.END
+
+    # Args >= 2: prima prova le destinazioni speciali (banca / proprieta alias),
+    # altrimenti cerca un utente per nome.
+    dest_raw = args[1].strip().lower()
+    dest_aliases = {
+        "banca": (BANK_ACCOUNT, "Banca"),
+        "bank":  (BANK_ACCOUNT, "Banca"),
+        "omar":      ("proprieta", "Omar"),
+        "proprieta": ("proprieta", "Omar"),
+        "proprietà": ("proprieta", "Omar"),
+    }
+    if dest_raw in dest_aliases:
+        dest_account, dest_label = dest_aliases[dest_raw]
+    else:
+        dest_user = find_user_by_name(dest_raw)
+        if not dest_user or not dest_user.get("account_code"):
+            await update.message.reply_text(
+                f"❌ Destinazione '{dest_raw}' non trovata.\n"
+                f"Usa il nome di un utente registrato, oppure 'banca'."
+            )
+            return ConversationHandler.END
+        dest_account = dest_user["account_code"]
+        dest_label = dest_user["display_name"]
+
+    if dest_account == sender_account:
+        await update.message.reply_text(
+            f"❌ Non puoi versare a te stesso ({sender_account})."
+        )
+        return ConversationHandler.END
+
+    ok, msg = _do_verso(
+        importo, dest_account, dest_label,
+        sender_account, sender_name, update.effective_user.id,
+    )
+    # No parse_mode — account codes contain underscores.
+    await update.message.reply_text(msg)
+    return ConversationHandler.END
+
+
+async def verso_on_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 2 del flow: l'utente ha scritto l'importo come messaggio."""
+    tg_user = await _require_admin(update)
+    if not tg_user:
+        return ConversationHandler.END
+
+    text = (update.message.text or "").strip().replace(",", ".")
+    try:
+        importo = float(text)
+    except ValueError:
+        await update.message.reply_text(
+            f"❌ '{text}' non è un numero valido. Riprova (solo il numero, es. 2000)."
+        )
+        return VERSO_AMOUNT
+    if importo <= 0:
+        await update.message.reply_text("❌ L'importo deve essere maggiore di zero. Riprova.")
+        return VERSO_AMOUNT
+
+    await _send_verso_keyboard(update.message, importo, tg_user["account_code"])
+    return ConversationHandler.END
+
+
+async def verso_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fallback /annulla per il flow di /verso."""
+    await update.message.reply_text("❌ Versamento annullato.")
+    return ConversationHandler.END
+
+
+async def verso_on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback handler per la tastiera di /verso: completa il versamento."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+
+    if data == "verso_cancel":
+        await query.edit_message_text("❌ Versamento annullato.")
+        return
+
+    if not data.startswith("verso:"):
+        return
+
+    tg_user = get_telegram_user(update.effective_user.id)
+    if (
+        not tg_user
+        or not tg_user.get("account_code")
+        or tg_user.get("role") not in ("contabile", "proprieta")
+    ):
+        await query.edit_message_text("🚫 Non sei autorizzato a versare.")
+        return
+
+    sender_account = tg_user["account_code"]
+    sender_name = tg_user.get("display_name") or "admin"
+
+    try:
+        _, importo_str, dest_account = data.split(":", 2)
+        importo = float(importo_str)
+    except (ValueError, IndexError):
+        await query.edit_message_text("❌ Errore nel callback.")
+        return
+
+    if dest_account == sender_account:
+        await query.edit_message_text("❌ Non puoi versare a te stesso.")
+        return
+
+    if dest_account == BANK_ACCOUNT:
+        dest_label = "Banca"
+    else:
+        dest_user = find_user_by_account_code(dest_account)
+        if not dest_user:
+            await query.edit_message_text("❌ Destinazione non trovata.")
+            return
+        dest_label = dest_user["display_name"]
+
+    ok, msg = _do_verso(
+        importo, dest_account, dest_label,
+        sender_account, sender_name, update.effective_user.id,
+    )
+    await query.edit_message_text(msg)
 
 
 # ============================================================
@@ -1421,6 +1604,11 @@ async def cmd_verso(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Stati del ConversationHandler
 PAY_SUPPLIER, PAY_AMOUNT, PAY_CASSA, PAY_CONFIRM = range(4)
 RACC_AMOUNT = 10  # Stato per /raccolgo (separato dai PAY_*)
+VERSO_AMOUNT = 11  # Stato per /verso
+
+# Account speciale per i versamenti in banca (NON un telegram_user — e' un
+# conto contabile diretto). Usato come callback_data per /verso.
+BANK_ACCOUNT = "banca"
 
 # Lista fornitori (code → label). Hardcoded perche':
 # - cambia raramente (nuovo fornitore = side-task migration + redeploy bot)
@@ -2206,7 +2394,19 @@ def main():
     app.add_handler(raccolgo_conv)
     app.add_handler(CallbackQueryHandler(racc_on_callback, pattern=r"^racc[:_]"))
 
-    app.add_handler(CommandHandler("verso", cmd_verso))
+    # /verso — stesso pattern di /raccolgo (flow conversazionale + tastiera).
+    verso_conv = ConversationHandler(
+        entry_points=[CommandHandler("verso", cmd_verso)],
+        states={
+            VERSO_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, verso_on_amount)],
+        },
+        fallbacks=[CommandHandler("annulla", verso_cancel)],
+        per_user=True,
+        per_chat=True,
+    )
+    app.add_handler(verso_conv)
+    app.add_handler(CallbackQueryHandler(verso_on_callback, pattern=r"^verso[:_]"))
+
     app.add_handler(CommandHandler("report_cassa", cmd_report_cassa))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
 

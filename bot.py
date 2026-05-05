@@ -1580,6 +1580,261 @@ async def verso_on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
+# /cambia — cambio valuta EUR → EGP (transit via cambio_valuta)
+# ============================================================
+# Aggiunto 05/05/2026 (richiesta Omar — Amr cambia ~10 volte/settimana).
+#
+# L'utente scrive 2 importi reali (EUR dato, EGP ricevuto). Il bot calcola
+# il rate, mostra conferma, e crea UNA entry con 4 righe:
+#
+#   dare  cambio_valuta      EUR <eur>
+#   avere <cassa>            EUR <eur>   ← user perde EUR dalla tasca
+#   dare  <cassa>            EGP <egp>   ← user riceve EGP in tasca
+#   avere cambio_valuta      EGP <egp>
+#
+# Bilanciato per-currency (EUR side e EGP side balance separately, come
+# richiesto dal trigger check_entry_balanced).
+#
+# Cassa = account_code di chi scrive il comando (Amr → cassa_contabile,
+# Omar → proprieta). Coerente con /raccolgo e /verso.
+#
+# IMPORTANTE: il conto 'cambio_valuta' deve esistere in accounts. Se manca,
+# l'INSERT delle lines fallisce (FK su account_code) e _do_cambio rolla
+# back l'entry. Mostra errore esplicito all'utente.
+
+def _do_cambio(
+    eur: float,
+    egp: float,
+    cassa_account: str,
+    cassa_name: str,
+    telegram_user_id: int,
+) -> tuple[bool, str]:
+    """Insert the balanced 4-line journal entry for /cambia.
+    Returns (ok, message). Uses the 'cambio_valuta' transit account to
+    balance EUR and EGP sides independently."""
+    rate = egp / eur if eur > 0 else 0
+    description = f"Cambio €{eur:.2f} → EGP {egp:.0f} (rate {rate:.2f})"
+    entry_id = insert_journal_entry(
+        description=description,
+        source="telegram",
+        telegram_user_id=telegram_user_id,
+        lines=[
+            # EUR side: cassa esce (avere), cambio_valuta riceve (dare)
+            {"account_code": "cambio_valuta",
+             "dare": eur, "avere": 0, "currency": "EUR"},
+            {"account_code": cassa_account,
+             "dare": 0, "avere": eur, "currency": "EUR"},
+            # EGP side: cassa riceve (dare), cambio_valuta esce (avere)
+            {"account_code": cassa_account,
+             "dare": egp, "avere": 0, "currency": "EGP"},
+            {"account_code": "cambio_valuta",
+             "dare": 0, "avere": egp, "currency": "EGP"},
+        ],
+    )
+    if not entry_id:
+        return False, (
+            "❌ Errore nel registrare. Verifica che il conto 'cambio_valuta' "
+            "esista in accounts. Riprova."
+        )
+    return True, (
+        f"✅ Cambio registrato!\n\n"
+        f"Hai dato:    €{eur:.2f} EUR\n"
+        f"Hai ricevuto: EGP {egp:,.0f}\n"
+        f"Rate:         1 EUR = {rate:.2f} EGP\n\n"
+        f"{cassa_account} ({cassa_name}): −€{eur:.2f}, +EGP {egp:,.0f}"
+    )
+
+
+async def _show_cambio_confirm(message, eur: float, egp: float):
+    """Render the confirmation card with summary + Conferma/Annulla buttons."""
+    rate = egp / eur if eur > 0 else 0
+    keyboard = [[
+        InlineKeyboardButton("✅ Conferma", callback_data="cambia_confirm"),
+        InlineKeyboardButton("❌ Annulla",  callback_data="cambia_cancel"),
+    ]]
+    # No parse_mode — i nomi conto contengono underscore e potrebbero
+    # finire dentro la message text in altri contesti. Plain + emoji.
+    await message.reply_text(
+        f"💱 Cambio valuta\n\n"
+        f"Hai dato:    €{eur:.2f} EUR\n"
+        f"Hai ricevuto: EGP {egp:,.0f}\n"
+        f"Rate:         1 EUR = {rate:.2f} EGP\n\n"
+        f"Confermi?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def cmd_cambia(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/cambia [eur] [egp]  — cambio valuta EUR → EGP.
+
+    Tre modalita':
+      - /cambia              → flow: chiede EUR poi EGP poi conferma
+      - /cambia 100          → flow accorciato: chiede solo EGP poi conferma
+      - /cambia 100 5050     → diretto: mostra conferma, registra al click
+
+    Cassa coinvolta = account_code del chiamante (cassa_contabile per Amr,
+    proprieta per Omar).
+    """
+    tg_user = await _require_admin(update)
+    if not tg_user:
+        return ConversationHandler.END
+
+    args = context.args
+
+    # Caso 1: nessun argomento → entra in flow chiedendo EUR
+    if len(args) == 0:
+        await update.message.reply_text(
+            "💱 Quanti EUR hai dato?\n"
+            "Scrivi solo il numero, es. 100.\n\n"
+            "(Annulla con /annulla)"
+        )
+        return CAMBIA_EUR_AMOUNT
+
+    # Parse primo arg (EUR)
+    try:
+        eur = float(args[0].replace(",", "."))
+    except ValueError:
+        await update.message.reply_text(f"❌ '{args[0]}' non è un numero valido.")
+        return ConversationHandler.END
+    if eur <= 0:
+        await update.message.reply_text("❌ L'importo EUR deve essere maggiore di zero.")
+        return ConversationHandler.END
+
+    # Caso 2: solo EUR → chiedi EGP
+    if len(args) == 1:
+        context.user_data["cambia_eur"] = eur
+        await update.message.reply_text(
+            f"💱 €{eur:.2f} EUR.\n\n"
+            f"Quanti EGP hai ricevuto?\n"
+            f"Scrivi solo il numero, es. 5050."
+        )
+        return CAMBIA_EGP_AMOUNT
+
+    # Caso 3: EUR + EGP → mostra conferma
+    try:
+        egp = float(args[1].replace(",", "."))
+    except ValueError:
+        await update.message.reply_text(f"❌ '{args[1]}' non è un numero valido.")
+        return ConversationHandler.END
+    if egp <= 0:
+        await update.message.reply_text("❌ L'importo EGP deve essere maggiore di zero.")
+        return ConversationHandler.END
+
+    context.user_data["cambia_eur"] = eur
+    context.user_data["cambia_egp"] = egp
+    await _show_cambio_confirm(update.message, eur, egp)
+    return CAMBIA_CONFIRM
+
+
+async def cambia_on_eur(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step EUR del flow: l'utente ha scritto l'importo EUR come messaggio."""
+    tg_user = await _require_admin(update)
+    if not tg_user:
+        return ConversationHandler.END
+
+    text = (update.message.text or "").strip().replace(",", ".")
+    try:
+        eur = float(text)
+    except ValueError:
+        await update.message.reply_text(
+            f"❌ '{text}' non è un numero valido. Riprova (solo il numero, es. 100)."
+        )
+        return CAMBIA_EUR_AMOUNT
+    if eur <= 0:
+        await update.message.reply_text("❌ Deve essere maggiore di zero. Riprova.")
+        return CAMBIA_EUR_AMOUNT
+
+    context.user_data["cambia_eur"] = eur
+    await update.message.reply_text(
+        f"💱 €{eur:.2f} EUR.\n\n"
+        f"Quanti EGP hai ricevuto?\n"
+        f"Scrivi solo il numero, es. 5050."
+    )
+    return CAMBIA_EGP_AMOUNT
+
+
+async def cambia_on_egp(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step EGP del flow: l'utente ha scritto l'importo EGP come messaggio."""
+    tg_user = await _require_admin(update)
+    if not tg_user:
+        return ConversationHandler.END
+
+    text = (update.message.text or "").strip().replace(",", ".")
+    try:
+        egp = float(text)
+    except ValueError:
+        await update.message.reply_text(
+            f"❌ '{text}' non è un numero valido. Riprova (solo il numero, es. 5050)."
+        )
+        return CAMBIA_EGP_AMOUNT
+    if egp <= 0:
+        await update.message.reply_text("❌ Deve essere maggiore di zero. Riprova.")
+        return CAMBIA_EGP_AMOUNT
+
+    eur = context.user_data.get("cambia_eur")
+    if not eur:
+        # Non dovrebbe succedere se il flow e' rispettato, ma difensivo
+        await update.message.reply_text(
+            "❌ Importo EUR perso. Ricomincia con /cambia."
+        )
+        return ConversationHandler.END
+
+    context.user_data["cambia_egp"] = egp
+    await _show_cambio_confirm(update.message, eur, egp)
+    return CAMBIA_CONFIRM
+
+
+async def cambia_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fallback /annulla per il flow di /cambia."""
+    context.user_data.pop("cambia_eur", None)
+    context.user_data.pop("cambia_egp", None)
+    await update.message.reply_text("❌ Cambio annullato.")
+    return ConversationHandler.END
+
+
+async def cambia_on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback dal bottone Conferma/Annulla: scrive l'entry o annulla."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+
+    if data == "cambia_cancel":
+        context.user_data.pop("cambia_eur", None)
+        context.user_data.pop("cambia_egp", None)
+        await query.edit_message_text("❌ Cambio annullato.")
+        return ConversationHandler.END
+
+    if data != "cambia_confirm":
+        return CAMBIA_CONFIRM
+
+    # Re-check permessi: solo contabile/proprieta con account_code possono cambiare
+    tg_user = get_telegram_user(update.effective_user.id)
+    if (
+        not tg_user
+        or not tg_user.get("account_code")
+        or tg_user.get("role") not in ("contabile", "proprieta")
+    ):
+        await query.edit_message_text("🚫 Non sei autorizzato a fare cambi valuta.")
+        return ConversationHandler.END
+
+    eur = context.user_data.get("cambia_eur")
+    egp = context.user_data.get("cambia_egp")
+    if not eur or not egp:
+        await query.edit_message_text("❌ Dati persi. Ricomincia con /cambia.")
+        return ConversationHandler.END
+
+    cassa_account = tg_user["account_code"]
+    cassa_name = tg_user.get("display_name") or "admin"
+
+    ok, msg = _do_cambio(eur, egp, cassa_account, cassa_name, update.effective_user.id)
+    await query.edit_message_text(msg)
+
+    context.user_data.pop("cambia_eur", None)
+    context.user_data.pop("cambia_egp", None)
+    return ConversationHandler.END
+
+
+# ============================================================
 # /paga_fornitore — registra pagamento fornitore con flow conversazionale
 # ============================================================
 # Aggiunto 26/04/2026 (richiesta Omar). Permette a contabile/proprieta di
@@ -1605,6 +1860,9 @@ async def verso_on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 PAY_SUPPLIER, PAY_AMOUNT, PAY_CASSA, PAY_CONFIRM = range(4)
 RACC_AMOUNT = 10  # Stato per /raccolgo (separato dai PAY_*)
 VERSO_AMOUNT = 11  # Stato per /verso
+CAMBIA_EUR_AMOUNT = 12  # Stato per /cambia, step "quanti EUR hai dato?"
+CAMBIA_EGP_AMOUNT = 13  # Stato per /cambia, step "quanti EGP hai ricevuto?"
+CAMBIA_CONFIRM = 14     # Stato per /cambia, attesa click su Conferma/Annulla
 
 # Account speciale per i versamenti in banca (NON un telegram_user — e' un
 # conto contabile diretto). Usato come callback_data per /verso.
@@ -2287,6 +2545,7 @@ ADMIN_COMMANDS = [
     BotCommand("start", "Istruzioni e info ruolo"),
     BotCommand("raccolgo", "Incassa soldi da una guida"),
     BotCommand("verso", "Versa soldi a proprieta o banca"),
+    BotCommand("cambia", "Cambio valuta EUR → EGP"),
     BotCommand("paga_fornitore", "Registra pagamento fornitore (Shamandura, ecc.)"),
     BotCommand("report_cassa", "Snapshot cassa contabile di oggi"),
     BotCommand("whoami", "Vedi chi sei nel sistema"),
@@ -2406,6 +2665,24 @@ def main():
     )
     app.add_handler(verso_conv)
     app.add_handler(CallbackQueryHandler(verso_on_callback, pattern=r"^verso[:_]"))
+
+    # /cambia — flow conversazionale (eur → egp → conferma con bottoni).
+    # 3 stati: EUR amount, EGP amount, confirm (callback con bottoni inline).
+    # La conferma e' un CallbackQueryHandler dentro il flow stesso (non
+    # globale come per /raccolgo) perche' qui dobbiamo accedere a
+    # context.user_data che e' per-conversazione.
+    cambia_conv = ConversationHandler(
+        entry_points=[CommandHandler("cambia", cmd_cambia)],
+        states={
+            CAMBIA_EUR_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, cambia_on_eur)],
+            CAMBIA_EGP_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, cambia_on_egp)],
+            CAMBIA_CONFIRM:    [CallbackQueryHandler(cambia_on_callback, pattern=r"^cambia_(confirm|cancel)$")],
+        },
+        fallbacks=[CommandHandler("annulla", cambia_cancel)],
+        per_user=True,
+        per_chat=True,
+    )
+    app.add_handler(cambia_conv)
 
     app.add_handler(CommandHandler("report_cassa", cmd_report_cassa))
     app.add_handler(CommandHandler("whoami", cmd_whoami))

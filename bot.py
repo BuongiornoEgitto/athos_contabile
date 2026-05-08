@@ -51,6 +51,11 @@ ALLOWED_GROUP_ID = None
 # ============================================================
 # Constants — Anthropic API + timeouts (estratti per leggibilita')
 # ============================================================
+ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_MODEL = "claude-sonnet-4-6"
+REQUEST_TIMEOUT_SECONDS = 30
+SHEETS_TIMEOUT_SECONDS = 10
+
 # ============================================================
 # Logging — proper structured logging invece di print sparsi
 # ============================================================
@@ -499,9 +504,15 @@ async def ask_claude(user_message: str) -> str:
             return "❌ Risposta AI non valida. Riprova."
         return content[0]["text"]
 
-    except Exception as e:
-        logger.error(f"Claude API Error: {str(e)}")
-        return "❌ Errore di comunicazione con l'AI. Riprova tra poco."
+    except requests.HTTPError as e:
+        logger.error(f"Anthropic HTTP error {e.response.status_code}: {e.response.text[:200]}")
+        return f"❌ Errore HTTP AI ({e.response.status_code}). Riprova fra poco."
+    except requests.RequestException as e:
+        logger.exception(f"Anthropic request error: {e}")
+        return f"❌ Errore connessione AI: {e}"
+    except (ValueError, KeyError) as e:
+        logger.exception(f"Anthropic response parse error: {e}")
+        return "❌ Risposta AI non valida. Riprova."
 
 
 # ============================================================

@@ -637,8 +637,32 @@ def _parse_claude_transaction(response: str) -> dict | None:
         return None
 
 
+def _amt(v) -> float:
+    try:
+        return float(v) if v not in (None, "", "null") else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _is_high_amount(tx: dict) -> tuple[bool, str]:
+    """Solo trigger 'importo elevato' (sanity check su grosse cifre).
+    Usato per decidere se mostrare preview su una singola transazione:
+    Omar vuole conferma SOLO per importi grossi, non per ogni dubbio
+    di classificazione di Claude (vedi richiesta 2026-05-08)."""
+    eur = _amt(tx.get("importo_eur"))
+    le = _amt(tx.get("importo_le"))
+    if eur > SUSPECT_EUR_THRESHOLD:
+        return True, f"importo elevato (€{eur:.0f})"
+    if le > SUSPECT_LE_THRESHOLD:
+        return True, f"importo elevato ({le:.0f} LE)"
+    return False, ""
+
+
 def _is_suspect(tx: dict) -> tuple[bool, str]:
     """Heuristic: è una transazione 'sospetta'? Restituisce (bool, motivo).
+
+    Usato nel preview multi-transazione per marcare le righe con ⚠️.
+    Per singola transazione vedi _is_high_amount (Omar vuole meno friction).
 
     Triggers:
       - Claude ha messo needs_review=true
@@ -651,12 +675,6 @@ def _is_suspect(tx: dict) -> tuple[bool, str]:
     nr = tx.get("needs_review")
     if nr is True or (isinstance(nr, str) and nr.strip().lower() == "true"):
         return True, "Claude segnala incertezza"
-
-    def _amt(v):
-        try:
-            return float(v) if v not in (None, "", "null") else 0.0
-        except (TypeError, ValueError):
-            return 0.0
 
     eur = _amt(tx.get("importo_eur"))
     le = _amt(tx.get("importo_le"))
@@ -1056,8 +1074,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Errore parsing risposta AI.")
         return
 
-    # Se l'unica transazione è "sospetta" → passa comunque dal preview
-    suspect, _reason = _is_suspect(tx)
+    # Singola transazione: preview SOLO se importo elevato (sanity check).
+    # Non blocchiamo piu' su needs_review / account fallback / descrizione corta:
+    # Omar (2026-05-08) vuole zero friction quando struttura del messaggio e'
+    # chiara (1 riga, +/- importo descrizione). Le multi-transazioni continuano
+    # ad usare _is_suspect dentro _format_preview per marcare le righe dubbie.
+    suspect, _reason = _is_high_amount(tx)
     if suspect:
         _pending_previews[user.id] = {
             "transactions": [tx],

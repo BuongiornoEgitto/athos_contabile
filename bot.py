@@ -51,11 +51,6 @@ ALLOWED_GROUP_ID = None
 # ============================================================
 # Constants — Anthropic API + timeouts (estratti per leggibilita')
 # ============================================================
-ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages"
-ANTHROPIC_MODEL = "claude-sonnet-4-6"
-REQUEST_TIMEOUT_SECONDS = 30
-SHEETS_TIMEOUT_SECONDS = 10
-
 # ============================================================
 # Logging — proper structured logging invece di print sparsi
 # ============================================================
@@ -504,15 +499,9 @@ async def ask_claude(user_message: str) -> str:
             return "❌ Risposta AI non valida. Riprova."
         return content[0]["text"]
 
-    except requests.HTTPError as e:
-        logger.error(f"Anthropic HTTP error {e.response.status_code}: {e.response.text[:200]}")
-        return f"❌ Errore HTTP AI ({e.response.status_code}). Riprova fra poco."
-    except requests.RequestException as e:
-        logger.exception(f"Anthropic request error: {e}")
-        return f"❌ Errore connessione AI: {e}"
-    except (ValueError, KeyError) as e:
-        logger.exception(f"Anthropic response parse error: {e}")
-        return "❌ Risposta AI non valida. Riprova."
+    except Exception as e:
+        logger.error(f"Claude API Error: {str(e)}")
+        return "❌ Errore di comunicazione con l'AI. Riprova tra poco."
 
 
 # ============================================================
@@ -1100,16 +1089,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================================
-# Slash commands — contabile + proprieta
+# Slash commands
 # ============================================================
-# /raccolgo e /verso funzionano sia per il contabile che per la proprieta.
-# Il conto mittente/destinatario della scrittura contabile viene preso
-# dall'account_code dell'utente che scrive:
-#   - se scrive Amr (contabile) → cassa_contabile
-#   - se scrive Omar (proprieta) → proprieta
-# Cosi' entrambi possono registrare movimenti coerenti con dove stanno
-# fisicamente i soldi (nel caso di Omar che incontra una guida in ufficio
-# e raccoglie direttamente senza passare da Amr).
+# /raccolgo e /verso sono aperti a chiunque abbia un account_code
+# (guide, manager, contabile, proprieta). Il conto mittente/destinatario
+# della scrittura contabile viene preso dall'account_code dell'utente
+# che scrive il comando — cosi' ognuno registra movimenti coerenti con
+# dove stanno fisicamente i soldi.
+# Gli altri comandi (cambia, paga_fornitore, report_cassa) restano
+# riservati a contabile/proprieta tramite _require_admin.
 async def _require_admin(update: Update):
     """Upsert the user and return their telegram_users row IFF they have
     admin role (contabile or proprieta). On rejection, replies and returns None."""
@@ -1131,12 +1119,108 @@ async def _require_admin(update: Update):
     return tg_user
 
 
+async def _require_account_user(update: Update):
+    """Upsert the user and return their telegram_users row IFF they have
+    an account_code. Used by /raccolgo and /verso, which are open to any
+    role with a cassa assegnata."""
+    upsert_telegram_user(update.effective_user)
+    tg_user = get_telegram_user(update.effective_user.id)
+
+    if not tg_user or not tg_user.get("account_code"):
+        await update.message.reply_text(
+            "⏳ Ti ho registrato ma Omar deve ancora associarti a un conto."
+        )
+        return None
+
+    return tg_user
+
+
+# Token riconosciuti come marcatori di valuta in /raccolgo e /verso.
+# Possono comparire come suffisso dell'importo ("5000le") o come token
+# separato ("5000 le saif"). Ordinati piu' lunghi prima per evitare match
+# parziali (es. "lire" prima di "le").
+EGP_SUFFIXES = ("lire", "egp", "le")
+EUR_SUFFIXES = ("euro", "eur", "€")
+EGP_TOKENS = {"le", "egp", "lire", "l.e.", "l.e", "egiziane"}
+EUR_TOKENS = {"eur", "euro", "€"}
+
+
+def _parse_amount_token(token: str) -> tuple[float | None, str | None]:
+    """Parse un singolo token tipo '5000le', '200', '200eur'. Ritorna
+    (importo, currency_o_None). Currency e' None se non specificata."""
+    s = token.strip().lower().replace(",", ".")
+    cur = None
+    for t in EGP_SUFFIXES:
+        if s.endswith(t) and len(s) > len(t):
+            cur = "EGP"
+            s = s[:-len(t)].strip()
+            break
+    if cur is None:
+        for t in EUR_SUFFIXES:
+            if s.endswith(t) and len(s) > len(t):
+                cur = "EUR"
+                s = s[:-len(t)].strip()
+                break
+    try:
+        return float(s), cur
+    except ValueError:
+        return None, None
+
+
+def _parse_amount_text(text: str) -> tuple[float | None, str]:
+    """Parse il testo libero del flow conversazionale. Accetta:
+    '200', '200 EUR', '5000 le', '5000le', '5,000 lire'. Default EUR."""
+    parts = (text or "").strip().split()
+    if not parts:
+        return None, "EUR"
+    amt, cur = _parse_amount_token(parts[0])
+    if amt is None:
+        return None, "EUR"
+    if cur is None and len(parts) > 1:
+        tail = parts[1].lower()
+        if tail in EGP_TOKENS:
+            cur = "EGP"
+        elif tail in EUR_TOKENS:
+            cur = "EUR"
+    return amt, (cur or "EUR")
+
+
+def _extract_currency_args(args: list[str]) -> tuple[list[str], float | None, str]:
+    """Estrae importo e valuta dagli args di /raccolgo o /verso. Ritorna
+    (args_residui_per_destinatario, importo, currency). Importo None se
+    args[0] non e' parsabile come numero."""
+    if not args:
+        return [], None, "EUR"
+    amt, cur = _parse_amount_token(args[0])
+    if amt is None:
+        return args, None, "EUR"
+    rest = list(args[1:])
+    # Se il prossimo token e' una keyword di valuta, la consuma.
+    if rest:
+        head = rest[0].lower()
+        if head in EGP_TOKENS:
+            cur = "EGP"
+            rest = rest[1:]
+        elif head in EUR_TOKENS:
+            cur = "EUR"
+            rest = rest[1:]
+    return rest, amt, (cur or "EUR")
+
+
+def _fmt_money(amount: float, currency: str) -> str:
+    """Display compatto: '€200.00' o 'EGP 5,000'."""
+    if currency == "EGP":
+        return f"EGP {amount:,.0f}"
+    return f"€{amount:,.2f}"
+
+
 def _do_raccolgo(
     importo: float,
     sender: dict,
     receiver_account: str,
     receiver_name: str,
     telegram_user_id: int,
+    currency: str = "EUR",
 ) -> tuple[bool, str]:
     """Insert the balanced journal entry for /raccolgo. The 'sender' is the
     telegram_user the money is collected FROM (any role with account_code)."""
@@ -1146,15 +1230,15 @@ def _do_raccolgo(
         telegram_user_id=telegram_user_id,
         lines=[
             {"account_code": receiver_account,
-             "dare": importo, "avere": 0, "currency": "EUR"},
+             "dare": importo, "avere": 0, "currency": currency},
             {"account_code": sender["account_code"],
-             "dare": 0, "avere": importo, "currency": "EUR"},
+             "dare": 0, "avere": importo, "currency": currency},
         ],
     )
     if not entry_id:
         return False, "❌ Errore nel registrare. Riprova."
     return True, (
-        f"✅ Raccolto €{importo:.2f} da {sender['display_name']}\n\n"
+        f"✅ Raccolto {_fmt_money(importo, currency)} da {sender['display_name']}\n\n"
         f"I soldi sono ora in {receiver_account} ({receiver_name})."
     )
 
@@ -1167,11 +1251,13 @@ async def _send_user_keyboard(
     cancel_data: str,                      # "racc_cancel" | "verso_cancel"
     title: str,                            # heading shown above the keyboard
     question: str,                         # prompt below the heading
+    currency: str = "EUR",
     exclude_account: str | None = None,
     extra_buttons: list[InlineKeyboardButton] | None = None,
 ) -> bool:
     """Render an inline keyboard with all telegram_users having an account_code.
     Optionally appends extra buttons (e.g. '🏦 Banca' for /verso) and an Annulla.
+    callback_data: '<prefix>:<currency>:<importo>:<account>'.
     Returns True if at least one option was shown, False otherwise."""
     users = fetch_users_with_account(exclude_account=exclude_account)
     if not users and not extra_buttons:
@@ -1182,14 +1268,14 @@ async def _send_user_keyboard(
         row = [
             InlineKeyboardButton(
                 _user_button_label(users[i]),
-                callback_data=f"{callback_prefix}:{importo:.2f}:{users[i]['account_code']}",
+                callback_data=f"{callback_prefix}:{currency}:{importo:.2f}:{users[i]['account_code']}",
             )
         ]
         if i + 1 < len(users):
             row.append(
                 InlineKeyboardButton(
                     _user_button_label(users[i + 1]),
-                    callback_data=f"{callback_prefix}:{importo:.2f}:{users[i + 1]['account_code']}",
+                    callback_data=f"{callback_prefix}:{currency}:{importo:.2f}:{users[i + 1]['account_code']}",
                 )
             )
         keyboard.append(row)
@@ -1207,12 +1293,18 @@ async def _send_user_keyboard(
 
 
 async def cmd_raccolgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/raccolgo [importo] [da_chi]  — flow entry point.
+    """/raccolgo [importo[valuta]] [le|egp] [da_chi]  — flow entry point.
 
-    Tre modalita':
+    Modalita':
       - /raccolgo                 → chiede importo, poi mostra lista utenti
-      - /raccolgo 200             → mostra subito la lista utenti
-      - /raccolgo 200 saif        → diretto (no tastiera, no flow)
+      - /raccolgo 200             → 200 EUR, mostra lista
+      - /raccolgo 5000le          → 5000 EGP, mostra lista
+      - /raccolgo 200 saif        → 200 EUR diretto da saif
+      - /raccolgo 5000 le saif    → 5000 EGP diretto da saif
+      - /raccolgo 5000le saif     → 5000 EGP diretto da saif
+
+    Default valuta = EUR. Per lire egiziane: suffisso 'le'/'egp'/'lire'
+    sull'importo, oppure parola separata subito dopo l'importo.
 
     Telegram in chat invia il comando subito quando lo selezioni
     dall'autocomplete: per questo /raccolgo da solo entra in un flow
@@ -1226,7 +1318,7 @@ async def cmd_raccolgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     il comando. Si puo' raccogliere da qualsiasi utente con account_code
     (guida, manager, contabile, proprieta) — esclusi se' stessi.
     """
-    tg_user = await _require_admin(update)
+    tg_user = await _require_account_user(update)
     if not tg_user:
         return ConversationHandler.END
 
@@ -1236,33 +1328,34 @@ async def cmd_raccolgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) == 0:
         await update.message.reply_text(
-            "💰 Quanto stai raccogliendo (€)?\n"
-            "Scrivi solo il numero, es. 200.\n\n"
+            "💰 Quanto stai raccogliendo?\n"
+            "Scrivi il numero — default EUR.\n"
+            "Per lire egiziane aggiungi 'le' o 'lire' (es. '5000 le').\n\n"
             "(Annulla con /annulla)"
         )
         return RACC_AMOUNT
 
-    try:
-        importo = float(args[0].replace(",", "."))
-    except ValueError:
+    rest, importo, currency = _extract_currency_args(args)
+    if importo is None:
         await update.message.reply_text(f"❌ '{args[0]}' non è un numero valido.")
         return ConversationHandler.END
     if importo <= 0:
         await update.message.reply_text("❌ L'importo deve essere maggiore di zero.")
         return ConversationHandler.END
 
-    if len(args) == 1:
+    if not rest:
         await _send_user_keyboard(
             update.message, importo,
             callback_prefix="racc",
             cancel_data="racc_cancel",
-            title=f"💰 Raccogli €{importo:.2f}",
+            title=f"💰 Raccogli {_fmt_money(importo, currency)}",
             question="Da chi?",
+            currency=currency,
             exclude_account=receiver_account,
         )
         return ConversationHandler.END
 
-    sender_name = " ".join(args[1:]).strip()
+    sender_name = " ".join(rest).strip()
     sender = find_user_by_name(sender_name)
     if not sender:
         await update.message.reply_text(
@@ -1280,7 +1373,8 @@ async def cmd_raccolgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     ok, msg = _do_raccolgo(
-        importo, sender, receiver_account, receiver_name, update.effective_user.id
+        importo, sender, receiver_account, receiver_name,
+        update.effective_user.id, currency=currency,
     )
     # No parse_mode — account codes contain underscores che rompono il Markdown.
     await update.message.reply_text(msg)
@@ -1289,16 +1383,16 @@ async def cmd_raccolgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def racc_on_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Step 2 del flow: l'utente ha scritto l'importo come messaggio."""
-    tg_user = await _require_admin(update)
+    tg_user = await _require_account_user(update)
     if not tg_user:
         return ConversationHandler.END
 
-    text = (update.message.text or "").strip().replace(",", ".")
-    try:
-        importo = float(text)
-    except ValueError:
+    text = (update.message.text or "").strip()
+    importo, currency = _parse_amount_text(text)
+    if importo is None:
         await update.message.reply_text(
-            f"❌ '{text}' non è un numero valido. Riprova (solo il numero, es. 200)."
+            f"❌ '{text}' non è un numero valido. Riprova "
+            f"(es. '200' per EUR, '5000 le' per lire egiziane)."
         )
         return RACC_AMOUNT
     if importo <= 0:
@@ -1309,8 +1403,9 @@ async def racc_on_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update.message, importo,
         callback_prefix="racc",
         cancel_data="racc_cancel",
-        title=f"💰 Raccogli €{importo:.2f}",
+        title=f"💰 Raccogli {_fmt_money(importo, currency)}",
         question="Da chi?",
+        currency=currency,
         exclude_account=tg_user["account_code"],
     )
     return ConversationHandler.END
@@ -1335,21 +1430,18 @@ async def racc_on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not data.startswith("racc:"):
         return
 
-    # Re-check permessi: solo contabile/proprieta con account_code possono raccogliere.
+    # Re-check permessi: serve un account_code (qualsiasi ruolo).
     tg_user = get_telegram_user(update.effective_user.id)
-    if (
-        not tg_user
-        or not tg_user.get("account_code")
-        or tg_user.get("role") not in ("contabile", "proprieta")
-    ):
+    if not tg_user or not tg_user.get("account_code"):
         await query.edit_message_text("🚫 Non sei autorizzato a raccogliere.")
         return
 
     receiver_account = tg_user["account_code"]
     receiver_name = tg_user.get("display_name") or "admin"
 
+    # Format: 'racc:<currency>:<importo>:<account_code>'
     try:
-        _, importo_str, account_code = data.split(":", 2)
+        _, currency, importo_str, account_code = data.split(":", 3)
         importo = float(importo_str)
     except (ValueError, IndexError):
         await query.edit_message_text("❌ Errore nel callback.")
@@ -1365,7 +1457,8 @@ async def racc_on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     ok, msg = _do_raccolgo(
-        importo, sender, receiver_account, receiver_name, update.effective_user.id
+        importo, sender, receiver_account, receiver_name,
+        update.effective_user.id, currency=currency,
     )
     await query.edit_message_text(msg)
 
@@ -1377,6 +1470,7 @@ def _do_verso(
     sender_account: str,
     sender_name: str,
     telegram_user_id: int,
+    currency: str = "EUR",
 ) -> tuple[bool, str]:
     """Insert the balanced journal entry for /verso. Returns (ok, message)."""
     entry_id = insert_journal_entry(
@@ -1385,44 +1479,53 @@ def _do_verso(
         telegram_user_id=telegram_user_id,
         lines=[
             {"account_code": dest_account,
-             "dare": importo, "avere": 0, "currency": "EUR"},
+             "dare": importo, "avere": 0, "currency": currency},
             {"account_code": sender_account,
-             "dare": 0, "avere": importo, "currency": "EUR"},
+             "dare": 0, "avere": importo, "currency": currency},
         ],
     )
     if not entry_id:
         return False, "❌ Errore nel registrare. Riprova."
     return True, (
-        f"✅ Versati €{importo:.2f} a {dest_label}\n\n"
+        f"✅ Versati {_fmt_money(importo, currency)} a {dest_label}\n\n"
         f"{sender_account} ({sender_name}) aggiornato."
     )
 
 
-async def _send_verso_keyboard(message, importo: float, exclude_account: str) -> bool:
+async def _send_verso_keyboard(
+    message, importo: float, exclude_account: str, currency: str = "EUR"
+) -> bool:
     """Tastiera per /verso: lista utenti + bottone 'Banca' come extra."""
     bank_btn = InlineKeyboardButton(
         "🏦 Banca",
-        callback_data=f"verso:{importo:.2f}:{BANK_ACCOUNT}",
+        callback_data=f"verso:{currency}:{importo:.2f}:{BANK_ACCOUNT}",
     )
     return await _send_user_keyboard(
         message, importo,
         callback_prefix="verso",
         cancel_data="verso_cancel",
-        title=f"💸 Versa €{importo:.2f}",
+        title=f"💸 Versa {_fmt_money(importo, currency)}",
         question="A chi?",
+        currency=currency,
         exclude_account=exclude_account,
         extra_buttons=[bank_btn],
     )
 
 
 async def cmd_verso(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/verso [importo] [destinazione]  — flow entry point.
+    """/verso [importo[valuta]] [le|egp] [destinazione]  — flow entry point.
 
-    Tre modalita':
+    Modalita':
       - /verso                    → chiede importo, poi mostra lista
-      - /verso 2000               → mostra subito la lista (utenti + banca)
-      - /verso 2000 omar          → diretto (no tastiera, no flow)
-      - /verso 500 banca          → diretto a banca
+      - /verso 2000               → 2000 EUR, mostra lista (utenti + banca)
+      - /verso 5000le             → 5000 EGP, mostra lista
+      - /verso 2000 omar          → 2000 EUR diretto a Omar
+      - /verso 500 banca          → 500 EUR diretto a banca
+      - /verso 5000 le banca      → 5000 EGP diretto a banca
+      - /verso 5000le banca       → 5000 EGP diretto a banca
+
+    Default valuta = EUR. Per lire egiziane: suffisso 'le'/'egp'/'lire'
+    sull'importo, oppure parola separata subito dopo l'importo.
 
     Scrittura:
       dare  <destinazione>         <importo>
@@ -1432,7 +1535,7 @@ async def cmd_verso(update: Update, context: ContextTypes.DEFAULT_TYPE):
     il comando. Si puo' versare a qualsiasi utente con account_code o a
     'banca' — escluso se' stessi.
     """
-    tg_user = await _require_admin(update)
+    tg_user = await _require_account_user(update)
     if not tg_user:
         return ConversationHandler.END
 
@@ -1442,28 +1545,28 @@ async def cmd_verso(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) == 0:
         await update.message.reply_text(
-            "💸 Quanto stai versando (€)?\n"
-            "Scrivi solo il numero, es. 2000.\n\n"
+            "💸 Quanto stai versando?\n"
+            "Scrivi il numero — default EUR.\n"
+            "Per lire egiziane aggiungi 'le' o 'lire' (es. '5000 le').\n\n"
             "(Annulla con /annulla)"
         )
         return VERSO_AMOUNT
 
-    try:
-        importo = float(args[0].replace(",", "."))
-    except ValueError:
+    rest, importo, currency = _extract_currency_args(args)
+    if importo is None:
         await update.message.reply_text(f"❌ '{args[0]}' non è un numero valido.")
         return ConversationHandler.END
     if importo <= 0:
         await update.message.reply_text("❌ L'importo deve essere maggiore di zero.")
         return ConversationHandler.END
 
-    if len(args) == 1:
-        await _send_verso_keyboard(update.message, importo, sender_account)
+    if not rest:
+        await _send_verso_keyboard(update.message, importo, sender_account, currency)
         return ConversationHandler.END
 
-    # Args >= 2: prima prova le destinazioni speciali (banca / proprieta alias),
+    # rest >= 1: prima prova le destinazioni speciali (banca / proprieta alias),
     # altrimenti cerca un utente per nome.
-    dest_raw = args[1].strip().lower()
+    dest_raw = rest[0].strip().lower()
     dest_aliases = {
         "banca": (BANK_ACCOUNT, "Banca"),
         "bank":  (BANK_ACCOUNT, "Banca"),
@@ -1493,6 +1596,7 @@ async def cmd_verso(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ok, msg = _do_verso(
         importo, dest_account, dest_label,
         sender_account, sender_name, update.effective_user.id,
+        currency=currency,
     )
     # No parse_mode — account codes contain underscores.
     await update.message.reply_text(msg)
@@ -1501,23 +1605,25 @@ async def cmd_verso(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def verso_on_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Step 2 del flow: l'utente ha scritto l'importo come messaggio."""
-    tg_user = await _require_admin(update)
+    tg_user = await _require_account_user(update)
     if not tg_user:
         return ConversationHandler.END
 
-    text = (update.message.text or "").strip().replace(",", ".")
-    try:
-        importo = float(text)
-    except ValueError:
+    text = (update.message.text or "").strip()
+    importo, currency = _parse_amount_text(text)
+    if importo is None:
         await update.message.reply_text(
-            f"❌ '{text}' non è un numero valido. Riprova (solo il numero, es. 2000)."
+            f"❌ '{text}' non è un numero valido. Riprova "
+            f"(es. '2000' per EUR, '50000 le' per lire egiziane)."
         )
         return VERSO_AMOUNT
     if importo <= 0:
         await update.message.reply_text("❌ L'importo deve essere maggiore di zero. Riprova.")
         return VERSO_AMOUNT
 
-    await _send_verso_keyboard(update.message, importo, tg_user["account_code"])
+    await _send_verso_keyboard(
+        update.message, importo, tg_user["account_code"], currency
+    )
     return ConversationHandler.END
 
 
@@ -1541,19 +1647,16 @@ async def verso_on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     tg_user = get_telegram_user(update.effective_user.id)
-    if (
-        not tg_user
-        or not tg_user.get("account_code")
-        or tg_user.get("role") not in ("contabile", "proprieta")
-    ):
+    if not tg_user or not tg_user.get("account_code"):
         await query.edit_message_text("🚫 Non sei autorizzato a versare.")
         return
 
     sender_account = tg_user["account_code"]
     sender_name = tg_user.get("display_name") or "admin"
 
+    # Format: 'verso:<currency>:<importo>:<dest_account>'
     try:
-        _, importo_str, dest_account = data.split(":", 2)
+        _, currency, importo_str, dest_account = data.split(":", 3)
         importo = float(importo_str)
     except (ValueError, IndexError):
         await query.edit_message_text("❌ Errore nel callback.")
@@ -1575,6 +1678,7 @@ async def verso_on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ok, msg = _do_verso(
         importo, dest_account, dest_label,
         sender_account, sender_name, update.effective_user.id,
+        currency=currency,
     )
     await query.edit_message_text(msg)
 
@@ -2526,19 +2630,22 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # "/" → confondente.
 #
 # Strategia per ruolo:
-#   - Default scope (qualsiasi utente, incl. guide): solo /start /whoami
+#   - Default scope (qualsiasi utente, incl. guide): /start, /whoami,
+#     /raccolgo, /verso (questi due sono aperti a chiunque abbia un
+#     account_code, vedi _require_account_user).
 #   - Per-chat scope (per ogni admin = contabile o proprieta): aggiungo
-#     /raccolgo e /verso. Gli altri comandi rimangono nascosti ai non-admin
-#     cosi' la guida non viene confusa da bottoni che non puo' usare.
+#     anche /cambia, /paga_fornitore, /report_cassa.
 #
 # Limite noto: BotCommandScopeChat funziona solo se il bot ha gia' avuto
 # almeno un'interazione con quell'utente (altrimenti Telegram restituisce
 # "chat not found"). Se aggiungiamo un nuovo contabile dopo aver gia'
 # fatto deploy, dovra' fare /start UNA volta e poi serve un riavvio del
-# bot perche' veda /raccolgo /verso. Per la rosa attuale (Amr + Omar)
+# bot perche' veda i comandi admin extra. Per la rosa attuale (Amr + Omar)
 # entrambi hanno gia' interagito → nessun problema.
 GUIDA_COMMANDS = [
     BotCommand("start", "Istruzioni e info ruolo"),
+    BotCommand("raccolgo", "Incassa soldi da un altro utente"),
+    BotCommand("verso", "Versa soldi a un altro utente o banca"),
     BotCommand("whoami", "Vedi chi sei nel sistema"),
 ]
 ADMIN_COMMANDS = [
@@ -2589,13 +2696,13 @@ async def _on_startup(application) -> None:
         print(f"[startup] set_my_commands default FAIL: {e}")
         return  # se il default fallisce, non ha senso provare gli scope per-chat
 
-    # 1b. Gruppi: tutti i membri (anche le guide) vedono tutti e 4 i comandi.
-    # Motivo: BotCommandScopeChat(chat_id=user_id) funziona solo in chat
-    # private, non nei gruppi. Per differenziare per-utente in un gruppo
-    # servirebbe BotCommandScopeChatMember(group_id, user_id) e quindi
-    # tenere traccia dei group_id → complessita' in piu' per un beneficio
-    # solo cosmetico: gli handler /raccolgo e /verso gia' filtrano per
-    # ruolo, quindi se una guida clicca il bot risponde "non sei contabile".
+    # 1b. Gruppi: tutti i membri vedono i comandi admin nel menu. Motivo:
+    # BotCommandScopeChat(chat_id=user_id) funziona solo in chat private,
+    # non nei gruppi. Per differenziare per-utente in un gruppo servirebbe
+    # BotCommandScopeChatMember(group_id, user_id) e quindi tenere traccia
+    # dei group_id → complessita' in piu' per un beneficio solo cosmetico:
+    # gli handler admin (cambia/paga_fornitore/report_cassa) filtrano per
+    # ruolo, quindi se una guida clicca il bot risponde "non autorizzato".
     try:
         await bot.set_my_commands(
             ADMIN_COMMANDS, scope=BotCommandScopeAllGroupChats()

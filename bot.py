@@ -389,11 +389,19 @@ def insert_journal_entry(
     telegram_user_id: int,
     lines: list,
     entry_date: str | None = None,
+    customer_name: str | None = None,
 ) -> str | None:
     """Create a balanced journal entry with N lines. Rolls back on failure.
 
     lines: list of {account_code, dare, avere, currency}. Sum(dare)==sum(avere)
     per currency must hold, or the balance check RPC will raise and we rollback.
+
+    Caso speciale: lines=[] e' lecito per gli eventi "informativi" che NON
+    movimentano cassa (es. source='cliente_paga_fornitore' — il cliente ha
+    pagato direttamente il fornitore, l'agenzia non ha messo soldi). In quel
+    caso saltiamo gli step 2-3 (insert lines, balance check) e ritorniamo
+    l'entry_id appena creato — header-only entry, valida secondo il check
+    aggregato (zero righe → balance vacuamente OK).
     """
     if not _sb_configured():
         return None
@@ -405,6 +413,8 @@ def insert_journal_entry(
         "source": source,
         "telegram_user_id": telegram_user_id,
     }
+    if customer_name:
+        entry_payload["customer_name"] = customer_name
     try:
         r = requests.post(
             f"{SUPABASE_URL}/rest/v1/journal_entries",
@@ -420,7 +430,10 @@ def insert_journal_entry(
         return None
     entry_id = r.json()[0]["id"]
 
-    # 2. Lines
+    # 2. Lines — skippato se la entry e' header-only (cliente_paga_fornitore)
+    if not lines:
+        return entry_id
+
     for ln in lines:
         ln["entry_id"] = entry_id
     try:
@@ -2154,7 +2167,12 @@ async def cambia_on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ============================================================
 
 # Stati del ConversationHandler
-PAY_SUPPLIER, PAY_AMOUNT, PAY_CASSA, PAY_CONFIRM = range(4)
+PAY_SUPPLIER, PAY_AMOUNT, PAY_CASSA, PAY_CONFIRM, PAY_CLIENT_NAME = range(5)
+
+# Sentinel per la "cassa" speciale "il cliente paga direttamente". Non e' un
+# account_code reale — quando arriva qui ramifichiamo a una entry header-only
+# (vedi pf_on_confirm + insert_journal_entry con lines=[]).
+CLIENTE_PAGA_SENTINEL = "cliente"
 RACC_AMOUNT = 10  # Stato per /raccolgo (separato dai PAY_*)
 VERSO_AMOUNT = 11  # Stato per /verso
 CAMBIA_EUR_AMOUNT = 12  # Stato per /cambia, step "quanti EUR hai dato?"
@@ -2216,6 +2234,7 @@ async def cmd_paga_fornitore(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data.pop("pf_supplier", None)
     context.user_data.pop("pf_amount", None)
     context.user_data.pop("pf_cassa", None)
+    context.user_data.pop("pf_client_name", None)
 
     # Costruisci tastiera 2 colonne con i 6 fornitori + bottone annulla
     keyboard = []
@@ -2289,24 +2308,40 @@ async def pf_on_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["pf_amount"] = importo
     supplier_label = _supplier_label(context.user_data.get("pf_supplier", ""))
 
-    keyboard = [[
-        InlineKeyboardButton(label, callback_data=f"pf_cassa:{code}")
-        for code, label in PAYER_CASSE
-    ], [
-        InlineKeyboardButton("❌ Annulla", callback_data="pf_cancel")
-    ]]
+    # Tastiera: 1 riga con le casse pagatrici (cassa contabile / proprieta),
+    # 1 riga con "Cliente" (sentinel per pagamento diretto cliente→fornitore),
+    # 1 riga con Annulla.
+    keyboard = [
+        [
+            InlineKeyboardButton(label, callback_data=f"pf_cassa:{code}")
+            for code, label in PAYER_CASSE
+        ],
+        [
+            InlineKeyboardButton(
+                "🧑 Cliente (paga direttamente)",
+                callback_data=f"pf_cassa:{CLIENTE_PAGA_SENTINEL}",
+            )
+        ],
+        [
+            InlineKeyboardButton("❌ Annulla", callback_data="pf_cancel")
+        ],
+    ]
 
     await update.message.reply_text(
         f"💼 Fornitore: {supplier_label}\n"
         f"💰 Importo: €{importo:.2f}\n\n"
-        f"🏦 Da quale cassa esce?",
+        f"🏦 Da chi vengono i soldi?",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
     return PAY_CASSA
 
 
 async def pf_on_cassa(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Step 4: utente ha scelto cassa → mostra riepilogo + conferma."""
+    """Step 4: utente ha scelto la fonte dei soldi.
+    - Se cassa interna → vai dritto al riepilogo (PAY_CONFIRM).
+    - Se 'Cliente' (CLIENTE_PAGA_SENTINEL) → chiedi nome e cognome del
+      cliente (PAY_CLIENT_NAME), poi riepilogo.
+    """
     query = update.callback_query
     await query.answer()
 
@@ -2321,6 +2356,16 @@ async def pf_on_cassa(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cassa_code = data.removeprefix("pf_cassa:")
     context.user_data["pf_cassa"] = cassa_code
+
+    # Branch: cliente paga direttamente → chiediamo il nome prima di confermare.
+    if cassa_code == CLIENTE_PAGA_SENTINEL:
+        await query.edit_message_text(
+            "🧑 Pagamento del cliente direttamente al fornitore.\n\n"
+            "Scrivi nome e cognome del cliente (es. 'Mario Rossi').\n"
+            "L'agenzia non muove cassa — registriamo solo per memoria.\n\n"
+            "(Annulla con /annulla)"
+        )
+        return PAY_CLIENT_NAME
 
     supplier_code = context.user_data.get("pf_supplier", "")
     importo = context.user_data.get("pf_amount", 0.0)
@@ -2346,6 +2391,45 @@ async def pf_on_cassa(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return PAY_CONFIRM
 
 
+async def pf_on_client_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Step 4b (solo per cliente_paga_fornitore): l'utente ha scritto il
+    nome e cognome del cliente come messaggio. Validiamo (>=2 char),
+    salviamo in user_data, mostriamo il riepilogo e chiediamo conferma.
+    """
+    raw = (update.message.text or "").strip()
+    # Validazione minima: almeno 2 caratteri non-whitespace. Non imponiamo
+    # pattern strict (nomi composti, accenti, transliterazioni arabe → tutti
+    # validi). Trimmiamo e collassiamo gli spazi multipli.
+    name = " ".join(raw.split())
+    if len(name) < 2:
+        await update.message.reply_text(
+            "❌ Nome troppo corto. Scrivi nome e cognome del cliente "
+            "(almeno 2 caratteri). Es. 'Mario Rossi'."
+        )
+        return PAY_CLIENT_NAME
+
+    context.user_data["pf_client_name"] = name
+
+    supplier_code = context.user_data.get("pf_supplier", "")
+    importo = context.user_data.get("pf_amount", 0.0)
+
+    keyboard = [[
+        InlineKeyboardButton("✅ Conferma", callback_data="pf_confirm"),
+        InlineKeyboardButton("❌ Annulla",  callback_data="pf_cancel"),
+    ]]
+
+    await update.message.reply_text(
+        "📋 Riepilogo pagamento (cliente diretto)\n\n"
+        f"• Fornitore: {_supplier_label(supplier_code)}\n"
+        f"• Importo: €{importo:.2f}\n"
+        f"• Pagato da: 🧑 {name} (cliente)\n"
+        f"• Movimento cassa agenzia: nessuno\n\n"
+        "Registro per memoria?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return PAY_CONFIRM
+
+
 async def pf_on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Step 5: scrive su Supabase + conferma."""
     query = update.callback_query
@@ -2362,6 +2446,7 @@ async def pf_on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     supplier_code = context.user_data.get("pf_supplier", "")
     cassa_code    = context.user_data.get("pf_cassa", "")
     importo       = float(context.user_data.get("pf_amount", 0.0))
+    client_name   = context.user_data.get("pf_client_name", "")
 
     if not (supplier_code and cassa_code and importo > 0):
         await query.edit_message_text(
@@ -2371,8 +2456,50 @@ async def pf_on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     supplier_label = _supplier_label(supplier_code)
-    cassa_label    = _cassa_label(cassa_code)
-    description    = f"Pagamento {supplier_label.lstrip('🌊✈️🚌🤿🛥📦 ')} €{importo:.2f}"
+    imp_round      = round(importo, 2)
+
+    # ---------- Branch A: cliente paga direttamente il fornitore ----------
+    # Nessun movimento di cassa per l'agenzia. Salviamo solo l'header con
+    # source='cliente_paga_fornitore' e customer_name. Vedi migration 026.
+    if cassa_code == CLIENTE_PAGA_SENTINEL:
+        if not client_name:
+            await query.edit_message_text(
+                "❌ Manca il nome del cliente. Riprova con /paga_fornitore."
+            )
+            context.user_data.clear()
+            return ConversationHandler.END
+
+        clean_supplier = supplier_label.lstrip('🌊✈️🚌🤿🛥📦 ')
+        description = (
+            f"Cliente {client_name} ha pagato direttamente {clean_supplier} "
+            f"€{imp_round:.2f}"
+        )
+        entry_id = insert_journal_entry(
+            description=description,
+            source="cliente_paga_fornitore",
+            telegram_user_id=update.effective_user.id,
+            lines=[],  # header-only: nessun movimento sui conti dell'agenzia
+            customer_name=client_name,
+        )
+        if not entry_id:
+            await query.edit_message_text(
+                "❌ Errore nel registrare. Riprova con /paga_fornitore."
+            )
+            context.user_data.clear()
+            return ConversationHandler.END
+
+        await query.edit_message_text(
+            f"✅ Registrato per memoria.\n\n"
+            f"🧑 {client_name} ha pagato €{imp_round:.2f} direttamente "
+            f"a {supplier_label}.\n"
+            f"Nessun movimento di cassa dell'agenzia."
+        )
+        context.user_data.clear()
+        return ConversationHandler.END
+
+    # ---------- Branch B: pagamento da cassa interna (flow originale) ----------
+    cassa_label = _cassa_label(cassa_code)
+    description = f"Pagamento {supplier_label.lstrip('🌊✈️🚌🤿🛥📦 ')} €{importo:.2f}"
 
     # Scrittura partita doppia "passing-through" su cassa_fornitore_X (4 righe).
     # Cambio del 27/04/2026 (richiesta Omar): il vecchio pattern 2-righe
@@ -2389,7 +2516,6 @@ async def pf_on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     #
     # Net effect su cassa_fornitore_X: 0 (debito creato + chiuso). Ma i 2
     # movimenti restano visibili nell'estratto conto del fornitore.
-    imp_round = round(importo, 2)
     entry_id = insert_journal_entry(
         description=description,
         source="telegram",
@@ -2999,10 +3125,11 @@ def main():
     paga_fornitore_conv = ConversationHandler(
         entry_points=[CommandHandler("paga_fornitore", cmd_paga_fornitore)],
         states={
-            PAY_SUPPLIER: [CallbackQueryHandler(pf_on_supplier, pattern=r"^pf_(supp|cancel)")],
-            PAY_AMOUNT:   [MessageHandler(filters.TEXT & ~filters.COMMAND, pf_on_amount)],
-            PAY_CASSA:    [CallbackQueryHandler(pf_on_cassa,    pattern=r"^pf_(cassa|cancel)")],
-            PAY_CONFIRM:  [CallbackQueryHandler(pf_on_confirm,  pattern=r"^pf_(confirm|cancel)")],
+            PAY_SUPPLIER:    [CallbackQueryHandler(pf_on_supplier, pattern=r"^pf_(supp|cancel)")],
+            PAY_AMOUNT:      [MessageHandler(filters.TEXT & ~filters.COMMAND, pf_on_amount)],
+            PAY_CASSA:       [CallbackQueryHandler(pf_on_cassa,    pattern=r"^pf_(cassa|cancel)")],
+            PAY_CLIENT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, pf_on_client_name)],
+            PAY_CONFIRM:     [CallbackQueryHandler(pf_on_confirm,  pattern=r"^pf_(confirm|cancel)")],
         },
         fallbacks=[CommandHandler("annulla", pf_cancel)],
         # Per-user: ogni utente ha il suo stato indipendente

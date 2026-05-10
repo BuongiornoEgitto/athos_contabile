@@ -248,13 +248,35 @@ poi scrive l'entry SOLO dopo il click.
 
 ### 4.5 `/paga_fornitore` — paga un fornitore (Shamandura, Shaarawy, …)
 
-Riservato a contabile/proprieta. Pattern a 4 righe (vedi commit 99f531a):
-il pagamento passa per `cassa_fornitore_<nome>` (deposito), che poi viene
-"consumato" come `costi_escursioni`. Permette di tenere traccia del credito
-verso il fornitore separatamente dal costo già rilevato.
+Riservato a contabile/proprieta. Due modalità diverse a seconda di chi mette
+i soldi:
 
-Flow conversazionale: scegli fornitore → importo → cassa di provenienza →
-conferma → scrittura.
+**A. Pagamento dalla cassa dell'agenzia** (caso normale).
+Pattern a 4 righe (vedi commit 99f531a): il pagamento passa per
+`cassa_fornitore_<nome>` (deposito), che poi viene "consumato" come
+`costi_escursioni`. Permette di tenere traccia del credito verso il
+fornitore separatamente dal costo già rilevato.
+
+**B. Pagamento del cliente direttamente al fornitore** (aggiunto 2026-05-10).
+Quando il turista paga in contanti il fornitore sul posto (es. dà 100 EUR a
+Shamandura in barca), l'agenzia non muove cassa propria. Salviamo solo un
+`journal_entries` header (zero `journal_lines`) con:
+- `source = 'cliente_paga_fornitore'`
+- `customer_name = 'Mario Rossi'`
+- `description` con fornitore, cliente, importo
+
+`cash_position` e P&L invariati. La entry resta visibile per audit/statistiche
+(query: `SELECT … FROM journal_entries WHERE source='cliente_paga_fornitore'`).
+
+Flow conversazionale (5 step):
+1. scegli fornitore
+2. importo
+3. fonte: cassa interna **oppure** "🧑 Cliente (paga direttamente)"
+4. (solo se Cliente) → scrivi nome e cognome del cliente
+5. conferma → scrittura
+
+Vedi migrazione `026_customer_paid_supplier.sql` per le modifiche allo schema
+(estensione CHECK su source + colonna `customer_name`).
 
 ### 4.6 `/report_cassa` (e job giornaliero alle 20:00)
 

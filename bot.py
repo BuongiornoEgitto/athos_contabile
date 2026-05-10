@@ -108,31 +108,41 @@ SUSPECT_LE_THRESHOLD = 60_000
 FALLBACK_ACCOUNTS = {"costi_altri", "ricavi_escursioni"}
 
 # ============================================================
-# Claude system prompt — now includes the chart of accounts so
-# Claude can classify each transaction into the right category
+# Claude system prompt — istruisce Claude su QUANDO chiamare il tool
+# register_transaction e su come scegliere account_code/tipo/currency.
+# Lo schema vero e proprio dei campi vive nel tool (vedi
+# _build_register_transaction_tool); qui mettiamo SOLO le regole di
+# business e gli esempi che lo schema da solo non può comunicare.
 # ============================================================
 SYSTEM_PROMPT = """Sei Athos, agente AI contabile per Buongiorno Egitto (agenzia viaggi Egitto).
 Rispondi SEMPRE in italiano e in modo conciso.
 
-Il tuo compito: parsare messaggi tipo "+200 tour piramidi" e restituire JSON con
-il giusto conto economico (ricavi/costi).
-
-REGOLE IMPORTO:
-- Se NON specifica valuta → importo va in "importo_eur", "importo_le" resta ""
-- Se contiene LE, L.E., lire, EGP, egp → importo va in "importo_le", "importo_eur" resta ""
-- NON convertire mai. Scrivi il numero esatto.
+COME RISPONDERE:
+- Se il messaggio è una transazione (es. "+200 tour piramidi", "-50 LE acqua"),
+  CHIAMA il tool register_transaction con i campi corretti. Non rispondere con
+  testo libero in quel caso.
+- Se il messaggio NON è una transazione (saluto, domanda, conversazione fra
+  colleghi che è arrivata al bot per sbaglio), NON chiamare il tool: rispondi
+  con un testo breve in italiano, suggerendo il formato corretto, es.
+  "Scrivi nel formato +/- importo descrizione".
 
 REGOLE TIPO:
-- "+", "in", "incasso", "entrata", "pagato da", "ricevuto da cliente" → tipo: "entrata"
-- "-", "spesa", "out", "pagamento", "costo", "speso per" → tipo: "uscita"
+- "+", "in", "incasso", "entrata", "pagato da", "ricevuto da cliente" → tipo "entrata"
+- "-", "spesa", "out", "pagamento", "costo", "speso per" → tipo "uscita"
 
-CONTO (account_code): scegli UNO di questi in base alla descrizione:
+REGOLE CURRENCY:
+- Default EUR. Se il messaggio contiene "LE", "L.E.", "lire", "EGP", "egp" →
+  currency "EGP". Non convertire mai: scrivi il numero esatto nella currency
+  scelta.
+
+REGOLE ACCOUNT_CODE — scegli SEMPRE da uno dei conti elencati nello schema
+del tool. Non inventare codici. Linee guida sulla scelta:
 
 RICAVI (quando tipo=entrata):
 - ricavi_escursioni → TUTTI gli incassi da clienti per tour ed escursioni
   (piramidi, luxor, assuan, abu simbel, deserto, mare, quad, cammello, ecc.).
-  DEFAULT: usa questo anche quando la descrizione contiene solo nome cliente
-  e/o hotel senza specificare l'attività.
+  DEFAULT per entrate: usa questo anche quando la descrizione contiene solo
+  nome cliente e/o hotel senza specificare l'attività.
 - ricavi_commissioni → commissioni da partner, hotel, negozi (solo se la
   descrizione contiene esplicitamente "commissione", "provvigione",
   "commission" o simili).
@@ -155,39 +165,42 @@ COSTI (quando tipo=uscita):
 - costi_bancari → fee PayPal, Stripe, bonifici, cambio valuta
 - costi_amministrativi → commercialista, licenze, permessi
 - costi_ufficio → cancelleria, attrezzatura ufficio, computer
-- costi_altri → tutto il resto delle spese
+- costi_altri → tutto il resto delle spese (FALLBACK: usa solo se nessun
+  altro conto sopra è applicabile, e in quel caso metti confidence "low").
 
 NOTA "commissione" — può essere sia entrata che uscita:
 - se tipo=entrata → ricavi_commissioni (es. guida vende foto e prende %)
 - se tipo=uscita → costi_escursioni (mance/commissioni ai driver durante tour)
 
 REGOLE DESCRIZIONE:
-- Tutto il testo dopo segno/cifra/valuta va in "descrizione"
+- Tutto il testo dopo segno/cifra/valuta va in "descrizione".
+- Se è inferiore a 2 caratteri, espandi con un placeholder ragionevole
+  ("transazione senza descrizione") e metti confidence "low".
 
-ESEMPI:
-"+200 tour piramidi" → TRANSACTION:{"tipo":"entrata","importo_eur":200,"importo_le":"","descrizione":"tour piramidi","account_code":"ricavi_escursioni"}
-"+150 escursione deserto" → TRANSACTION:{"tipo":"entrata","importo_eur":150,"importo_le":"","descrizione":"escursione deserto","account_code":"ricavi_escursioni"}
-"+300 Mario Rossi Hotel Sunrise" → TRANSACTION:{"tipo":"entrata","importo_eur":300,"importo_le":"","descrizione":"Mario Rossi Hotel Sunrise","account_code":"ricavi_escursioni"}
-"-50 pranzo clienti" → TRANSACTION:{"tipo":"uscita","importo_eur":50,"importo_le":"","descrizione":"pranzo clienti","account_code":"costi_ristoranti"}
-"-300 cammello" → TRANSACTION:{"tipo":"uscita","importo_eur":300,"importo_le":"","descrizione":"cammello","account_code":"costi_escursioni"}
-"-50 mancia motorista" → TRANSACTION:{"tipo":"uscita","importo_eur":50,"importo_le":"","descrizione":"mancia motorista","account_code":"costi_escursioni"}
-"-20 acqua clienti" → TRANSACTION:{"tipo":"uscita","importo_eur":20,"importo_le":"","descrizione":"acqua clienti","account_code":"costi_escursioni"}
-"-100 LE snorkeling" → TRANSACTION:{"tipo":"uscita","importo_eur":"","importo_le":100,"descrizione":"snorkeling","account_code":"costi_escursioni"}
-"-1000 LE guida canyon" → TRANSACTION:{"tipo":"uscita","importo_eur":"","importo_le":1000,"descrizione":"guida canyon","account_code":"costi_guide_esterne"}
-"-500 LE biglietto valle re" → TRANSACTION:{"tipo":"uscita","importo_eur":"","importo_le":500,"descrizione":"biglietto valle re","account_code":"costi_ingressi"}
-"+100 commissione foto" → TRANSACTION:{"tipo":"entrata","importo_eur":100,"importo_le":"","descrizione":"commissione foto","account_code":"ricavi_commissioni"}
-"-30 commissione driver" → TRANSACTION:{"tipo":"uscita","importo_eur":30,"importo_le":"","descrizione":"commissione driver","account_code":"costi_escursioni"}
-"entrata 100 commissione foto" → TRANSACTION:{"tipo":"entrata","importo_eur":100,"importo_le":"","descrizione":"commissione foto","account_code":"ricavi_commissioni"}
-"uscita 30 acqua clienti" → TRANSACTION:{"tipo":"uscita","importo_eur":30,"importo_le":"","descrizione":"acqua clienti","account_code":"costi_escursioni"}
+REGOLE CONFIDENCE:
+- "high" → classificazione netta: account_code ovvio, descrizione chiara,
+  tipo non ambiguo (es. "+200 tour piramidi", "-50 LE biglietto valle re").
+- "low" → ALMENO UNA delle seguenti:
+  • la descrizione è ambigua o contiene parole sconosciute
+  • hai dovuto usare un account fallback (ricavi_escursioni come default
+    senza indicazione esplicita, costi_altri come ultima spiaggia)
+  • il segno (+/-) è in conflitto con l'uso tipico della parola
+    (es. "+1 acqua" — acqua di solito è un costo, non un ricavo)
 
-Rispondi SOLO con il JSON nel formato:
-TRANSACTION:{"tipo":"...","importo_eur":...,"importo_le":"...","descrizione":"...","account_code":"..."}
-
-CAMPO OPZIONALE "needs_review" (bool): aggiungilo a true SOLO se sei incerto
-sulla classificazione (descrizione ambigua, parola sconosciuta, ecc.).
-Esempio: "+90 Davide domina" → TRANSACTION:{"tipo":"entrata","importo_eur":90,"importo_le":"","descrizione":"Davide domina","account_code":"ricavi_escursioni","needs_review":true}
-
-Se il messaggio non e' una transazione, rispondi: "Scrivi nel formato +/- importo descrizione"
+ESEMPI (input → input al tool register_transaction):
+"+200 tour piramidi" → tipo=entrata currency=EUR importo=200 descrizione="tour piramidi" account_code=ricavi_escursioni confidence=high
+"+150 escursione deserto" → tipo=entrata currency=EUR importo=150 descrizione="escursione deserto" account_code=ricavi_escursioni confidence=high
+"+300 Mario Rossi Hotel Sunrise" → tipo=entrata currency=EUR importo=300 descrizione="Mario Rossi Hotel Sunrise" account_code=ricavi_escursioni confidence=high
+"-50 pranzo clienti" → tipo=uscita currency=EUR importo=50 descrizione="pranzo clienti" account_code=costi_ristoranti confidence=high
+"-300 cammello" → tipo=uscita currency=EUR importo=300 descrizione="cammello" account_code=costi_escursioni confidence=high
+"-50 mancia motorista" → tipo=uscita currency=EUR importo=50 descrizione="mancia motorista" account_code=costi_escursioni confidence=high
+"-100 LE snorkeling" → tipo=uscita currency=EGP importo=100 descrizione="snorkeling" account_code=costi_escursioni confidence=high
+"-1000 LE guida canyon" → tipo=uscita currency=EGP importo=1000 descrizione="guida canyon" account_code=costi_guide_esterne confidence=high
+"-500 LE biglietto valle re" → tipo=uscita currency=EGP importo=500 descrizione="biglietto valle re" account_code=costi_ingressi confidence=high
+"+100 commissione foto" → tipo=entrata currency=EUR importo=100 descrizione="commissione foto" account_code=ricavi_commissioni confidence=high
+"-30 commissione driver" → tipo=uscita currency=EUR importo=30 descrizione="commissione driver" account_code=costi_escursioni confidence=high
+"+90 Davide domina" → tipo=entrata currency=EUR importo=90 descrizione="Davide domina" account_code=ricavi_escursioni confidence=low
+"+1 acqua" → tipo=entrata currency=EUR importo=1 descrizione="acqua" account_code=ricavi_escursioni confidence=low
 """
 
 
@@ -305,6 +318,37 @@ def fetch_users_with_account(exclude_account: str | None = None) -> list[dict]:
     except Exception as e:
         print(f"fetch_users_with_account error: {e}")
     return []
+
+
+def fetch_active_economic_accounts() -> list[str]:
+    """Ritorna i `code` dei conti attivi di tipo ricavo o costo, in ordine
+    alfabetico. Usato per popolare l'enum dinamico di `account_code` nel
+    tool register_transaction (cosi' Claude non puo' inventare codici).
+
+    Crash se Supabase non risponde o ritorna lista vuota — un enum vuoto
+    farebbe rifiutare a Claude qualsiasi tool call, e un enum stale e'
+    peggio di un crash chiaro all'avvio.
+    """
+    if not _sb_configured():
+        raise RuntimeError(
+            "Supabase non configurato — impossibile caricare il piano dei conti"
+        )
+    r = requests.get(
+        f"{SUPABASE_URL}/rest/v1/accounts"
+        f"?type=in.(ricavo,costo)&active=eq.true"
+        f"&select=code&order=code.asc",
+        headers=_sb_headers(),
+        timeout=10,
+    )
+    r.raise_for_status()
+    rows = r.json() or []
+    codes = [row["code"] for row in rows if row.get("code")]
+    if not codes:
+        raise RuntimeError(
+            "Piano dei conti vuoto (nessun ricavo/costo attivo) — "
+            "applica le migrazioni Supabase prima di avviare il bot"
+        )
+    return codes
 
 
 def find_user_by_account_code(account_code: str) -> dict | None:
@@ -449,13 +493,139 @@ def _save_to_sheets(data: dict) -> bool:
 # ============================================================
 # Claude call
 # ============================================================
-async def ask_claude(user_message: str) -> str:
-    """Chiama Claude per parsare un messaggio in TRANSACTION:{...}.
+# ============================================================
+# Tool schema — register_transaction
+# ============================================================
+# Lo schema e' costruito a runtime perche' l'enum di `account_code` viene
+# popolato dai conti veri presenti in Supabase (vedi
+# fetch_active_economic_accounts). Cosi' Claude non puo' inventare codici
+# inesistenti — il modello vede SOLO i conti che esistono nel DB.
+#
+# Cache process-wide: il tool e' costruito una volta a startup
+# (init_claude_tool) e riusato per ogni messaggio. Per riflettere nuovi
+# conti aggiunti via SQL serve un riavvio del bot.
+_REGISTER_TRANSACTION_TOOL: dict | None = None
 
-    Usa prompt caching (cache_control: ephemeral) sul SYSTEM_PROMPT —
-    i messaggi successivi al primo (entro 5min TTL) leggono il prompt
-    cachato → ~80% di risparmio sui token di input.
+
+def _build_register_transaction_tool(active_accounts: list[str]) -> dict:
+    """Costruisce lo schema del tool. active_accounts deve essere non vuoto
+    (validato a monte da fetch_active_economic_accounts)."""
+    return {
+        "name": "register_transaction",
+        "description": (
+            "Register a single accounting transaction in the double-entry "
+            "journal. Use ONLY when the user message describes one transaction "
+            "with amount + description (e.g., '+200 tour piramidi', '-50 LE "
+            "acqua'). Do NOT use for greetings, questions, conversation, or "
+            "ambiguous text without a clear amount."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": [
+                "tipo", "currency", "importo",
+                "account_code", "descrizione", "confidence",
+            ],
+            "properties": {
+                "tipo": {
+                    "type": "string",
+                    "enum": ["entrata", "uscita"],
+                    "description": (
+                        "entrata = incasso/ricavo (+ sign, 'incasso', "
+                        "'ricevuto'); uscita = spesa/costo (- sign, 'spesa', "
+                        "'pagato', 'speso')"
+                    ),
+                },
+                "currency": {
+                    "type": "string",
+                    "enum": ["EUR", "EGP"],
+                    "description": (
+                        "EUR by default. EGP if the message contains "
+                        "'LE', 'L.E.', 'lire', 'EGP', or 'egp'."
+                    ),
+                },
+                "importo": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "description": (
+                        "Numeric amount in the chosen currency, as written by "
+                        "the user. Example: 200, 1500.5, 5000. Never convert "
+                        "between currencies."
+                    ),
+                },
+                "account_code": {
+                    "type": "string",
+                    "enum": active_accounts,
+                    "description": (
+                        "Economic account code. Choose the most specific match "
+                        "from the list. For unclear income use "
+                        "'ricavi_escursioni' and set confidence='low'. For "
+                        "unclear expense use 'costi_altri' (last resort) and "
+                        "set confidence='low'. See SYSTEM PROMPT for full "
+                        "category descriptions."
+                    ),
+                },
+                "descrizione": {
+                    "type": "string",
+                    "minLength": 2,
+                    "maxLength": 200,
+                    "description": (
+                        "Short Italian description of the transaction "
+                        "(e.g., 'tour piramidi', 'pranzo clienti', "
+                        "'mancia driver'). Pass through the user's words."
+                    ),
+                },
+                "confidence": {
+                    "type": "string",
+                    "enum": ["high", "low"],
+                    "description": (
+                        "high = unambiguous classification. low = at least "
+                        "one of: ambiguous description, fallback account "
+                        "(ricavi_escursioni without explicit hint, or "
+                        "costi_altri), sign conflicts with typical use of "
+                        "the word (e.g., '+1 acqua' — acqua is usually a "
+                        "cost, not income)."
+                    ),
+                },
+            },
+        },
+    }
+
+
+def init_claude_tool() -> None:
+    """Idempotente: fetcha i conti attivi e costruisce il tool schema.
+    Chiamato a startup. Crash se Supabase non risponde — meglio non avviare
+    che girare con uno schema vuoto/stale."""
+    global _REGISTER_TRANSACTION_TOOL
+    accounts = fetch_active_economic_accounts()
+    _REGISTER_TRANSACTION_TOOL = _build_register_transaction_tool(accounts)
+    logger.info(
+        f"register_transaction tool inizializzato con "
+        f"{len(accounts)} conti economici: {accounts}"
+    )
+
+
+# ============================================================
+# Claude API — un'unica chiamata che usa il tool register_transaction
+# come canale strutturato di output. Per messaggi non-transazione il
+# modello risponde con testo libero (vedi system prompt).
+# ============================================================
+async def ask_claude(user_message: str) -> tuple[str, dict | str]:
+    """Chiama Claude. Ritorna una tupla (kind, payload) tipata:
+      - ("tx", dict)  → il modello ha chiamato register_transaction; dict
+                        contiene i campi tipati validati dallo schema
+      - ("msg", str)  → il modello ha risposto testo libero (es. "questo
+                        non sembra una transazione") oppure errore API
+                        con messaggio user-facing prefissato da ❌
+
+    Usa prompt caching ephemeral sul SYSTEM_PROMPT — dopo la prima
+    chiamata, le successive entro 5min leggono il prompt cachato.
     """
+    if _REGISTER_TRANSACTION_TOOL is None:
+        return "msg", (
+            "❌ Bot non inizializzato (tool schema mancante). "
+            "Riavvia o contatta Omar."
+        )
+
     try:
         response = requests.post(
             ANTHROPIC_MESSAGES_URL,
@@ -466,7 +636,7 @@ async def ask_claude(user_message: str) -> str:
             },
             json={
                 "model": ANTHROPIC_MODEL,
-                "max_tokens": 300,
+                "max_tokens": 400,
                 "system": [
                     {
                         "type": "text",
@@ -474,19 +644,24 @@ async def ask_claude(user_message: str) -> str:
                         "cache_control": {"type": "ephemeral"},
                     }
                 ],
+                "tools": [_REGISTER_TRANSACTION_TOOL],
+                # tool_choice="auto": Claude decide se chiamare il tool
+                # (transazione) o rispondere con testo (non-transazione).
+                # "force" qui sarebbe pericoloso: registrerebbe ANCHE messaggi
+                # non-transazione (es. "+200 ciao a tutti") inquinando il
+                # journal con tx spurie.
+                "tool_choice": {"type": "auto"},
                 "messages": [{"role": "user", "content": user_message}],
             },
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
-        # raise_for_status() esplicito → HTTP 4xx/5xx diventa eccezione
-        # invece di silent failure su data["content"] = KeyError piu' tardi.
         response.raise_for_status()
         data = response.json()
 
         if "error" in data:
             err_msg = data["error"].get("message", "sconosciuto")
             logger.error(f"Anthropic API error: {err_msg}")
-            return f"❌ Errore API: {err_msg}"
+            return "msg", f"❌ Errore API: {err_msg}"
 
         # Log token usage — cache_read > 0 conferma che il caching funziona
         usage = data.get("usage", {})
@@ -494,25 +669,44 @@ async def ask_claude(user_message: str) -> str:
             f"tokens — input: {usage.get('input_tokens', 0)}, "
             f"cache_read: {usage.get('cache_read_input_tokens', 0)}, "
             f"cache_create: {usage.get('cache_creation_input_tokens', 0)}, "
-            f"output: {usage.get('output_tokens', 0)}"
+            f"output: {usage.get('output_tokens', 0)}, "
+            f"stop_reason: {data.get('stop_reason')}"
         )
 
-        # Estrazione safe: content puo' essere lista vuota o senza 'text'
         content = data.get("content") or []
-        if not content or "text" not in content[0]:
-            logger.error(f"Risposta Anthropic inattesa: {str(data)[:300]}")
-            return "❌ Risposta AI non valida. Riprova."
-        return content[0]["text"]
+
+        # Cerca il primo blocco tool_use con name=register_transaction.
+        # Se presente → estraiamo i campi tipati. Se non c'è, scaliamo al
+        # primo blocco di tipo "text" come messaggio user-facing.
+        for block in content:
+            if (
+                block.get("type") == "tool_use"
+                and block.get("name") == "register_transaction"
+            ):
+                tx = block.get("input") or {}
+                # L'API garantisce che `input` rispetta lo schema dichiarato
+                # (enum, required, types). Logghiamo comunque per audit.
+                logger.info(
+                    f"tool_use register_transaction: {tx}"
+                )
+                return "tx", tx
+
+        for block in content:
+            if block.get("type") == "text":
+                return "msg", block.get("text", "").strip()
+
+        logger.error(f"Risposta Anthropic senza tool_use né text: {str(data)[:300]}")
+        return "msg", "❌ Risposta AI non valida. Riprova."
 
     except requests.HTTPError as e:
         logger.error(f"Anthropic HTTP error {e.response.status_code}: {e.response.text[:200]}")
-        return f"❌ Errore HTTP AI ({e.response.status_code}). Riprova fra poco."
+        return "msg", f"❌ Errore HTTP AI ({e.response.status_code}). Riprova fra poco."
     except requests.RequestException as e:
         logger.exception(f"Anthropic request error: {e}")
-        return f"❌ Errore connessione AI: {e}"
+        return "msg", f"❌ Errore connessione AI: {e}"
     except (ValueError, KeyError) as e:
         logger.exception(f"Anthropic response parse error: {e}")
-        return "❌ Risposta AI non valida. Riprova."
+        return "msg", "❌ Risposta AI non valida. Riprova."
 
 
 # ============================================================
@@ -522,46 +716,42 @@ def _build_economic_lines(
     tipo: str,
     cassa_account: str,
     economic_account: str,
-    importo_eur,
-    importo_le,
+    importo,
+    currency: str,
 ) -> list:
     """Build the 2 balanced lines for a guide/proprieta income/expense event.
 
     entrata (incasso):  dare cassa_xxx     /  avere ricavi_xxx
     uscita  (spesa):    avere cassa_xxx    /  dare  costi_xxx
+
+    Una sola currency per tx (semplificazione introdotta col refactor a
+    tool use 2026-05-10): un messaggio = un importo in una currency.
+    Per scrivere in EUR e EGP nello stesso evento serve /cambia, non
+    questa via.
     """
-    def amount(v):
-        try:
-            return float(v) if v not in (None, "", "null") else 0
-        except (TypeError, ValueError):
-            return 0
+    try:
+        amt = float(importo) if importo not in (None, "", "null") else 0.0
+    except (TypeError, ValueError):
+        amt = 0.0
+    if amt <= 0:
+        return []
+    if currency not in ("EUR", "EGP"):
+        return []
 
-    eur = amount(importo_eur)
-    le = amount(importo_le)
-    lines = []
-
-    for amt, currency in ((eur, "EUR"), (le, "EGP")):
-        if amt <= 0:
-            continue
-        if tipo == "entrata":
-            lines.append({
-                "account_code": cassa_account,
-                "dare": amt, "avere": 0, "currency": currency,
-            })
-            lines.append({
-                "account_code": economic_account,
-                "dare": 0, "avere": amt, "currency": currency,
-            })
-        else:  # uscita
-            lines.append({
-                "account_code": economic_account,
-                "dare": amt, "avere": 0, "currency": currency,
-            })
-            lines.append({
-                "account_code": cassa_account,
-                "dare": 0, "avere": amt, "currency": currency,
-            })
-    return lines
+    if tipo == "entrata":
+        return [
+            {"account_code": cassa_account,
+             "dare": amt, "avere": 0, "currency": currency},
+            {"account_code": economic_account,
+             "dare": 0, "avere": amt, "currency": currency},
+        ]
+    else:  # uscita
+        return [
+            {"account_code": economic_account,
+             "dare": amt, "avere": 0, "currency": currency},
+            {"account_code": cassa_account,
+             "dare": 0, "avere": amt, "currency": currency},
+        ]
 
 
 # ============================================================
@@ -626,17 +816,6 @@ def _split_transactions(text: str) -> list[str]:
     return pieces
 
 
-def _parse_claude_transaction(response: str) -> dict | None:
-    """Estrae il dict da una risposta Claude TRANSACTION:{...}. None se invalida."""
-    if not response or not response.startswith("TRANSACTION:"):
-        return None
-    try:
-        return json.loads(response.replace("TRANSACTION:", "").strip())
-    except Exception as e:
-        print(f"parse_claude_transaction error: {e} -- raw: {response[:200]}")
-        return None
-
-
 def _amt(v) -> float:
     try:
         return float(v) if v not in (None, "", "null") else 0.0
@@ -649,12 +828,12 @@ def _is_high_amount(tx: dict) -> tuple[bool, str]:
     Usato per decidere se mostrare preview su una singola transazione:
     Omar vuole conferma SOLO per importi grossi, non per ogni dubbio
     di classificazione di Claude (vedi richiesta 2026-05-08)."""
-    eur = _amt(tx.get("importo_eur"))
-    le = _amt(tx.get("importo_le"))
-    if eur > SUSPECT_EUR_THRESHOLD:
-        return True, f"importo elevato (€{eur:.0f})"
-    if le > SUSPECT_LE_THRESHOLD:
-        return True, f"importo elevato ({le:.0f} LE)"
+    importo = _amt(tx.get("importo"))
+    currency = tx.get("currency", "EUR")
+    if currency == "EUR" and importo > SUSPECT_EUR_THRESHOLD:
+        return True, f"importo elevato (€{importo:.0f})"
+    if currency == "EGP" and importo > SUSPECT_LE_THRESHOLD:
+        return True, f"importo elevato ({importo:.0f} LE)"
     return False, ""
 
 
@@ -665,23 +844,18 @@ def _is_suspect(tx: dict) -> tuple[bool, str]:
     Per singola transazione vedi _is_high_amount (Omar vuole meno friction).
 
     Triggers:
-      - Claude ha messo needs_review=true
+      - Claude ha messo confidence="low" (incertezza esplicita)
       - importo > soglia (1900 EUR o 60000 LE)
-      - account_code è il fallback (costi_altri/ricavi_escursioni) E descrizione
-        cortissima o vuota — il classificatore probabilmente non ha capito
+      - account_code è un fallback E descrizione cortissima — segnale che
+        Claude ha riempito con un default senza capire bene
     """
-    # Truthy check: Claude può restituire bool true OR string "true"/"True".
-    # `is True` era troppo stretto e ignorava la stringa.
-    nr = tx.get("needs_review")
-    if nr is True or (isinstance(nr, str) and nr.strip().lower() == "true"):
+    confidence = (tx.get("confidence") or "").strip().lower()
+    if confidence == "low":
         return True, "Claude segnala incertezza"
 
-    eur = _amt(tx.get("importo_eur"))
-    le = _amt(tx.get("importo_le"))
-    if eur > SUSPECT_EUR_THRESHOLD:
-        return True, f"importo elevato (€{eur:.0f})"
-    if le > SUSPECT_LE_THRESHOLD:
-        return True, f"importo elevato ({le:.0f} LE)"
+    high, reason = _is_high_amount(tx)
+    if high:
+        return True, reason
 
     descrizione = (tx.get("descrizione") or "").strip()
     account_code = tx.get("account_code") or ""
@@ -696,28 +870,12 @@ def _format_amount(tx: dict) -> str:
     """Formatta l'importo in stile '+90 EUR' / '-1000 LE'."""
     tipo = tx.get("tipo")
     sign = "+" if tipo == "entrata" else "-"
-    eur = tx.get("importo_eur")
-    le = tx.get("importo_le")
-    # Tratto 0 come "non specificato" così cade sull'altra valuta — evita "+0 EUR"
-    # quando in realtà l'importo è in LE.
-    def _has_amt(v):
-        if v in (None, "", "null"):
-            return False
-        try:
-            return float(v) > 0
-        except (TypeError, ValueError):
-            return False
-    if _has_amt(eur):
-        try:
-            return f"{sign}{int(float(eur))} EUR"
-        except (TypeError, ValueError):
-            return f"{sign}{eur} EUR"
-    if _has_amt(le):
-        try:
-            return f"{sign}{int(float(le))} LE"
-        except (TypeError, ValueError):
-            return f"{sign}{le} LE"
-    return f"{sign}? "
+    importo = _amt(tx.get("importo"))
+    currency = tx.get("currency", "EUR")
+    if importo <= 0:
+        return f"{sign}? "
+    label = "EUR" if currency == "EUR" else "LE"
+    return f"{sign}{int(importo)} {label}"
 
 
 def _format_preview(transactions: list[dict]) -> str:
@@ -754,13 +912,15 @@ def _write_one_transaction(
         "ricavi_escursioni" if tipo == "entrata" else "costi_altri"
     )
     descrizione = tx.get("descrizione", "")
+    currency = tx.get("currency", "EUR")
+    importo = _amt(tx.get("importo"))
 
     lines = _build_economic_lines(
         tipo=tipo,
         cassa_account=cassa_account,
         economic_account=account_code,
-        importo_eur=tx.get("importo_eur"),
-        importo_le=tx.get("importo_le"),
+        importo=importo,
+        currency=currency,
     )
     if not lines:
         return None, descrizione
@@ -772,12 +932,14 @@ def _write_one_transaction(
         lines=lines,
     )
     if entry_id:
-        # Mirror to Sheets — stesso payload del flusso single
+        # Mirror to Sheets — il GAS legacy si aspetta importo_eur/importo_le
+        # come campi separati. Manteniamo quel contratto qui anche se il
+        # nostro modello interno e' (importo, currency).
         _save_to_sheets({
             "guida": (user_first_name or "")[:8],
             "tipo": tipo,
-            "importo_eur": tx.get("importo_eur", ""),
-            "importo_le": tx.get("importo_le", ""),
+            "importo_eur": importo if currency == "EUR" else "",
+            "importo_le": importo if currency == "EGP" else "",
             "descrizione": descrizione,
         })
     return entry_id, descrizione
@@ -790,12 +952,11 @@ def _format_single_confirmation(
     """Riproduce il messaggio di conferma usato dal flusso single."""
     tipo = tx.get("tipo")
     emoji = "💚" if tipo == "entrata" else "🔴"
-    eur = tx.get("importo_eur", "")
-    le = tx.get("importo_le", "")
-    if eur and str(eur) != "":
-        importo_str = f"€{eur}"
-    else:
-        importo_str = f"{le} LE"
+    importo = _amt(tx.get("importo"))
+    currency = tx.get("currency", "EUR")
+    importo_str = (
+        f"€{importo:g}" if currency == "EUR" else f"{importo:g} LE"
+    )
     account_code = tx.get("account_code") or (
         "ricavi_escursioni" if tipo == "entrata" else "costi_altri"
     )
@@ -1017,28 +1178,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pieces = _split_transactions(text)
         transactions = []
         for piece in pieces:
-            response = await ask_claude(piece)
-            tx = _parse_claude_transaction(response)
-            if tx is None:
-                # Una sotto-transazione non parsata → segnaliamo e continuiamo
-                # mettendola comunque in coda con flag suspect.
-                # Il fallback per "tipo" guarda sia il segno che le keyword
-                # (entrata/incasso/in/ricevuto → entrata, altrimenti → uscita).
+            kind, payload = await ask_claude(piece)
+            if kind == "tx":
+                transactions.append(payload)
+            else:
+                # Claude non ha chiamato il tool su questo pezzo: lo mettiamo
+                # comunque in preview con confidence "low" cosi' l'utente
+                # decide se tenerlo. Fallback per `tipo`: segno o keyword.
                 piece_lower = piece.lstrip().lower()
                 if re.match(r"^(\+|entrata|incasso|in\s|ricevuto)", piece_lower):
                     fallback_tipo = "entrata"
+                    fallback_account = "ricavi_escursioni"
                 else:
                     fallback_tipo = "uscita"
+                    fallback_account = "costi_altri"
                 transactions.append({
                     "tipo": fallback_tipo,
-                    "importo_eur": "",
-                    "importo_le": "",
+                    "currency": "EUR",
+                    "importo": 0,
                     "descrizione": piece[:60],
-                    "account_code": "costi_altri" if fallback_tipo == "uscita" else "ricavi_escursioni",
-                    "needs_review": True,
+                    "account_code": fallback_account,
+                    "confidence": "low",
                 })
-            else:
-                transactions.append(tx)
 
         if not transactions:
             await update.message.reply_text(
@@ -1063,19 +1224,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # --- Single transaction path ---
-    response = await ask_claude(text)
-
-    if not response.startswith("TRANSACTION:"):
-        await update.message.reply_text(response)
+    kind, payload = await ask_claude(text)
+    if kind != "tx":
+        # Claude ha risposto con testo (non era una transazione, oppure errore).
+        # `payload` e' gia' user-facing in italiano (i casi errore sono
+        # prefissati da ❌ in ask_claude).
+        await update.message.reply_text(payload)
         return
 
-    tx = _parse_claude_transaction(response)
-    if tx is None:
-        await update.message.reply_text("❌ Errore parsing risposta AI.")
-        return
+    tx = payload
 
     # Singola transazione: preview SOLO se importo elevato (sanity check).
-    # Non blocchiamo piu' su needs_review / account fallback / descrizione corta:
+    # Non blocchiamo piu' su confidence=low / account fallback / descrizione corta:
     # Omar (2026-05-08) vuole zero friction quando struttura del messaggio e'
     # chiara (1 riga, +/- importo descrizione). Le multi-transazioni continuano
     # ad usare _is_suspect dentro _format_preview per marcare le righe dubbie.
@@ -1105,8 +1265,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tipo=tx.get("tipo"),
             cassa_account=tg_user["account_code"],
             economic_account=tx.get("account_code") or "costi_altri",
-            importo_eur=tx.get("importo_eur"),
-            importo_le=tx.get("importo_le"),
+            importo=tx.get("importo"),
+            currency=tx.get("currency", "EUR"),
         )
         if not lines_check:
             await update.message.reply_text("❌ Nessun importo valido nel messaggio.")
@@ -2767,6 +2927,11 @@ def main():
     # Fail-fast su env vars mancanti (errore esplicito invece di crash
     # criptico al primo messaggio). Vedi validate_environment() in cima.
     validate_environment()
+
+    # Carica i conti economici attivi da Supabase e costruisce lo schema
+    # del tool register_transaction. Crash con messaggio chiaro se il fetch
+    # fallisce — meglio non avviare che girare con un enum vuoto/stale.
+    init_claude_tool()
 
     print("🚀 Athos Bot (double-entry) avviato...")
     app = (

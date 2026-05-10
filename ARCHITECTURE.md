@@ -257,6 +257,15 @@ Pattern a 4 righe (vedi commit 99f531a): il pagamento passa per
 `costi_escursioni`. Permette di tenere traccia del credito verso il
 fornitore separatamente dal costo già rilevato.
 
+**Permessi**: ammessi `role IN (contabile, proprieta)` **OR**
+`can_pay_supplier=TRUE` su `telegram_users` (flag opt-in, default false,
+vedi migrazione 027). Per concedere il permesso a una guida specifica:
+```sql
+UPDATE telegram_users SET can_pay_supplier = TRUE
+WHERE display_name ILIKE '%nome%';
+```
+Per togliere: stesso pattern con `FALSE`. Helper: `_require_paga_fornitore_user`.
+
 **B. Pagamento del cliente direttamente al fornitore** (aggiunto 2026-05-10).
 Quando il turista paga in contanti il fornitore sul posto (es. dà 100 EUR a
 Shamandura in barca), l'agenzia non muove cassa propria. Salviamo solo un

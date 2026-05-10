@@ -1341,6 +1341,33 @@ async def _require_account_user(update: Update):
     return tg_user
 
 
+async def _require_paga_fornitore_user(update: Update):
+    """Variante di _require_admin per /paga_fornitore: ammette anche utenti
+    non-admin che hanno il flag opt-in `can_pay_supplier=TRUE` su
+    telegram_users (vedi migration 027). Cosi' Omar puo' concedere accesso
+    a singole guide (es. Haytham) con una UPDATE SQL, senza redeploy.
+    /cambia e /report_cassa restano _require_admin (admin-only)."""
+    upsert_telegram_user(update.effective_user)
+    tg_user = get_telegram_user(update.effective_user.id)
+
+    if not tg_user or not tg_user.get("account_code"):
+        await update.message.reply_text(
+            "⏳ Ti ho registrato ma Omar deve ancora associarti a un conto."
+        )
+        return None
+
+    role = tg_user.get("role")
+    can_pay = bool(tg_user.get("can_pay_supplier"))
+    if role not in ("contabile", "proprieta") and not can_pay:
+        await update.message.reply_text(
+            "🚫 Non sei autorizzato a pagare i fornitori. "
+            "Chiedi a Omar di abilitarti."
+        )
+        return None
+
+    return tg_user
+
+
 # Token riconosciuti come marcatori di valuta in /raccolgo e /verso.
 # Possono comparire come suffisso dell'importo ("5000le") o come token
 # separato ("5000 le saif"). Ordinati piu' lunghi prima per evitare match
@@ -2225,8 +2252,9 @@ def _cassa_label(code: str) -> str:
 
 
 async def cmd_paga_fornitore(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Entry point: /paga_fornitore — mostra tastiera fornitori."""
-    tg_user = await _require_admin(update)
+    """Entry point: /paga_fornitore — mostra tastiera fornitori.
+    Ammessi: contabile, proprieta, oppure utenti con can_pay_supplier=TRUE."""
+    tg_user = await _require_paga_fornitore_user(update)
     if not tg_user:
         return ConversationHandler.END
 

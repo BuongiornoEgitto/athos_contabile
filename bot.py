@@ -2232,6 +2232,10 @@ PAYER_CASSE = [
 # servisse differenziare (es. trasporti per Naama Safari), aggiungere step
 # di scelta categoria. Per ora 90% dei pagamenti = escursioni.
 PAYFORN_COST_ACCOUNT = "costi_escursioni"
+# Categoria di ricavo per il Branch A ("cliente paga direttamente al fornitore"):
+# il cliente consegna 150€ al fornitore → 150€ ricavi nostri + saldo cassa_fornitore
+# che cala mano a mano che il fornitore consuma il servizio o ci restituisce.
+PAYFORN_REVENUE_ACCOUNT = "ricavi_escursioni"
 
 
 def _supplier_label(code: str) -> str:
@@ -2487,8 +2491,14 @@ async def pf_on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     imp_round      = round(importo, 2)
 
     # ---------- Branch A: cliente paga direttamente il fornitore ----------
-    # Nessun movimento di cassa per l'agenzia. Salviamo solo l'header con
-    # source='cliente_paga_fornitore' e customer_name. Vedi migration 026.
+    # Schema migration 011: i soldi sono fisicamente in mano al fornitore
+    # ma logicamente nostri (l'incasso E' un nostro ricavo). Quindi:
+    #   DARE  cassa_fornitore_X       ← soldi in mano al fornitore (asset)
+    #   AVERE ricavi_escursioni       ← ricavo riconosciuto
+    # Il saldo positivo su cassa_fornitore_X cala quando il fornitore consuma
+    # il servizio (futuro entry con costi_X / cassa_fornitore_X) o ci
+    # restituisce il resto (cassa_contabile / cassa_fornitore_X).
+    # source='cliente_paga_fornitore' + customer_name (migration 026).
     if cassa_code == CLIENTE_PAGA_SENTINEL:
         if not client_name:
             await query.edit_message_text(
@@ -2506,7 +2516,12 @@ async def pf_on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             description=description,
             source="cliente_paga_fornitore",
             telegram_user_id=update.effective_user.id,
-            lines=[],  # header-only: nessun movimento sui conti dell'agenzia
+            lines=[
+                {"account_code": supplier_code,
+                 "dare": imp_round, "avere": 0, "currency": "EUR"},
+                {"account_code": PAYFORN_REVENUE_ACCOUNT,
+                 "dare": 0, "avere": imp_round, "currency": "EUR"},
+            ],
             customer_name=client_name,
         )
         if not entry_id:
@@ -2517,10 +2532,10 @@ async def pf_on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
 
         await query.edit_message_text(
-            f"✅ Registrato per memoria.\n\n"
+            f"✅ Registrato.\n\n"
             f"🧑 {client_name} ha pagato €{imp_round:.2f} direttamente "
             f"a {supplier_label}.\n"
-            f"Nessun movimento di cassa dell'agenzia."
+            f"I soldi risultano ora in {supplier_label} (in mano al fornitore)."
         )
         context.user_data.clear()
         return ConversationHandler.END

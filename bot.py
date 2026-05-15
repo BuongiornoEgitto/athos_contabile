@@ -390,100 +390,71 @@ def insert_journal_entry(
     lines: list,
     entry_date: str | None = None,
     customer_name: str | None = None,
+    supplier_code: str | None = None,
+    payment_reference: str | None = None,
+    pharos_match_status: str | None = None,
+    pharos_booking_code: str | None = None,
 ) -> str | None:
-    """Create a balanced journal entry with N lines. Rolls back on failure.
+    """Create a balanced journal entry with N lines via atomic Supabase RPC.
 
     lines: list of {account_code, dare, avere, currency}. Sum(dare)==sum(avere)
-    per currency must hold, or the balance check RPC will raise and we rollback.
-
-    Caso speciale: lines=[] e' lecito per gli eventi "informativi" che NON
-    movimentano cassa (es. source='cliente_paga_fornitore' — il cliente ha
-    pagato direttamente il fornitore, l'agenzia non ha messo soldi). In quel
-    caso saltiamo gli step 2-3 (insert lines, balance check) e ritorniamo
-    l'entry_id appena creato — header-only entry, valida secondo il check
-    aggregato (zero righe → balance vacuamente OK).
+    per currency must hold. The database RPC creates header + lines in one
+    transaction and rejects invalid/header-only entries (migration 029).
     """
     if not _sb_configured():
         return None
 
-    # 1. Header
-    entry_payload = {
-        "entry_date": entry_date or datetime.now().strftime("%Y-%m-%d"),
-        "description": description,
-        "source": source,
-        "telegram_user_id": telegram_user_id,
+    payload = {
+        "p_description": description,
+        "p_lines": lines,
+        "p_telegram_user_id": (
+            int(telegram_user_id) if telegram_user_id is not None else None
+        ),
+        "p_source": source,
+        "p_entry_date": entry_date or datetime.now().strftime("%Y-%m-%d"),
+        "p_external_id": None,
+        "p_customer_name": customer_name,
     }
-    if customer_name:
-        entry_payload["customer_name"] = customer_name
+    if supplier_code is not None:
+        payload["p_supplier_code"] = supplier_code
+    if payment_reference is not None:
+        payload["p_payment_reference"] = payment_reference
+    if pharos_match_status is not None:
+        payload["p_pharos_match_status"] = pharos_match_status
+    if pharos_booking_code is not None:
+        payload["p_pharos_booking_code"] = pharos_booking_code
     try:
         r = requests.post(
-            f"{SUPABASE_URL}/rest/v1/journal_entries",
-            headers=_sb_headers({"Prefer": "return=representation"}),
-            json=entry_payload,
-            timeout=10,
-        )
-    except Exception as e:
-        print(f"journal_entries insert error: {e}")
-        return None
-    if r.status_code not in (200, 201):
-        print(f"journal_entries insert: {r.status_code} {r.text[:200]}")
-        return None
-    entry_id = r.json()[0]["id"]
-
-    # 2. Lines — skippato se la entry e' header-only (cliente_paga_fornitore)
-    if not lines:
-        return entry_id
-
-    for ln in lines:
-        ln["entry_id"] = entry_id
-    try:
-        r = requests.post(
-            f"{SUPABASE_URL}/rest/v1/journal_lines",
-            headers=_sb_headers({"Prefer": "return=minimal"}),
-            json=lines,
-            timeout=10,
-        )
-    except Exception as e:
-        print(f"journal_lines insert error: {e}")
-        _rollback_entry(entry_id)
-        return None
-    if r.status_code not in (200, 201, 204):
-        print(f"journal_lines insert: {r.status_code} {r.text[:200]}")
-        _rollback_entry(entry_id)
-        return None
-
-    # 3. Balance verification via RPC
-    try:
-        r = requests.post(
-            f"{SUPABASE_URL}/rest/v1/rpc/check_entry_balanced",
+            f"{SUPABASE_URL}/rest/v1/rpc/create_balanced_journal_entry",
             headers=_sb_headers(),
-            json={"p_entry_id": entry_id},
-            timeout=10,
+            json=payload,
+            timeout=15,
         )
     except Exception as e:
-        print(f"balance check error: {e}")
-        _rollback_entry(entry_id)
+        print(f"RPC create_balanced_journal_entry error: {e}")
         return None
+
     if r.status_code not in (200, 204):
-        print(f"balance check failed: {r.status_code} {r.text[:200]}")
-        _rollback_entry(entry_id)
+        print(f"RPC create_balanced_journal_entry: {r.status_code} {r.text[:300]}")
+        return None
+
+    try:
+        result = r.json() if r.text else {}
+    except Exception as e:
+        print(f"RPC create_balanced_journal_entry non-JSON response: {e}")
+        return None
+
+    if not result.get("ok", False):
+        print(f"RPC create_balanced_journal_entry failed: {result.get('msg', 'RPC fallita.')}")
+        return None
+
+    entry_id = result.get("entry_id")
+    if not entry_id:
+        print("RPC create_balanced_journal_entry missing entry_id")
         return None
 
     print(f"journal entry {entry_id} saved with {len(lines)} lines")
     return entry_id
-
-
-def _rollback_entry(entry_id: str) -> None:
-    """Delete a journal entry (lines cascade)."""
-    try:
-        requests.delete(
-            f"{SUPABASE_URL}/rest/v1/journal_entries?id=eq.{entry_id}",
-            headers=_sb_headers(),
-            timeout=10,
-        )
-        print(f"rolled back entry {entry_id}")
-    except Exception as e:
-        print(f"rollback error for {entry_id}: {e}")
 
 
 def _save_to_sheets(data: dict) -> bool:
@@ -2267,6 +2238,7 @@ async def cmd_paga_fornitore(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data.pop("pf_amount", None)
     context.user_data.pop("pf_cassa", None)
     context.user_data.pop("pf_client_name", None)
+    context.user_data.pop("pf_payment_reference", None)
 
     # Costruisci tastiera 2 colonne con i 6 fornitori + bottone annulla
     keyboard = []
@@ -2394,7 +2366,8 @@ async def pf_on_cassa(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "🧑 Pagamento del cliente direttamente al fornitore.\n\n"
             "Scrivi nome e cognome del cliente (es. 'Mario Rossi').\n"
-            "L'agenzia non muove cassa — registriamo solo per memoria.\n\n"
+            "La data pagamento sarà oggi; potrai abbinarlo alla prenotazione "
+            "Pharos appena esiste.\n\n"
             "(Annulla con /annulla)"
         )
         return PAY_CLIENT_NAME
@@ -2455,8 +2428,9 @@ async def pf_on_client_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• Fornitore: {_supplier_label(supplier_code)}\n"
         f"• Importo: €{importo:.2f}\n"
         f"• Pagato da: 🧑 {name} (cliente)\n"
-        f"• Movimento cassa agenzia: nessuno\n\n"
-        "Registro per memoria?",
+        f"• Data pagamento: oggi\n"
+        f"• Match Pharos: da abbinare\n\n"
+        "Registro?",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
     return PAY_CONFIRM
@@ -2523,6 +2497,8 @@ async def pf_on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
                  "dare": 0, "avere": imp_round, "currency": "EUR"},
             ],
             customer_name=client_name,
+            supplier_code=supplier_code,
+            pharos_match_status="pending",
         )
         if not entry_id:
             await query.edit_message_text(

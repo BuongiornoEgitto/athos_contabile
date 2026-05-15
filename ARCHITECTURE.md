@@ -33,10 +33,9 @@ committare.
                                                 ▼
                             ┌───────────────────────────────────────┐
                             │  insert_journal_entry()               │
-                            │  - INSERT journal_entries (header)    │
-                            │  - INSERT journal_lines (dare/avere)  │
-                            │  - RPC check_entry_balanced()  ◄ if   │
-                            │    sbilanciato → rollback             │
+                            │  - RPC create_balanced_journal_entry  │
+                            │  - header + lines + balance check     │
+                            │    in transazione Postgres            │
                             └────────────────┬──────────────────────┘
                                              │
                               ┌──────────────┴───────────────┐
@@ -129,9 +128,9 @@ ID dell'utente Telegram autore.
 ### `journal_lines` — righe dare/avere
 Ogni riga ha **dare XOR avere** (constraint a livello tabella) e una
 **currency** (`EUR` o `EGP`). La somma `dare = avere` deve valere **per
-ogni currency separatamente** (controllo via RPC `check_entry_balanced`,
-chiamato dal bot dopo gli INSERT — se fallisce, il bot fa rollback
-cancellando l'entry).
+ogni currency separatamente**. Il bot crea le scritture tramite RPC
+`create_balanced_journal_entry`, che inserisce header + righe e valida il
+bilanciamento nella stessa transazione Postgres.
 
 ### Viste utili
 - `cash_position` — saldi delle casse fisiche per currency.
@@ -266,22 +265,34 @@ WHERE display_name ILIKE '%nome%';
 ```
 Per togliere: stesso pattern con `FALSE`. Helper: `_require_paga_fornitore_user`.
 
-**B. Pagamento del cliente direttamente al fornitore** (aggiunto 2026-05-10).
-Quando il turista paga in contanti il fornitore sul posto (es. dà 100 EUR a
-Shamandura in barca), l'agenzia non muove cassa propria. Salviamo solo un
-`journal_entries` header (zero `journal_lines`) con:
+**B. Pagamento del cliente direttamente al fornitore** (aggiunto 2026-05-10,
+aggiornato per Pharos matching).
+Quando il turista paga direttamente il fornitore, anche via bonifico prima che
+la prenotazione esista in Pharos, l'agenzia non muove cassa interna ma riconosce
+subito il ricavo e il valore in mano/al conto del fornitore:
+
+```text
+DARE   cassa_fornitore_X
+AVERE  ricavi_escursioni
+```
+
+La `journal_entries` conserva i dati per audit e riconciliazione:
 - `source = 'cliente_paga_fornitore'`
 - `customer_name = 'Mario Rossi'`
+- `supplier_code = 'cassa_fornitore_x'`
+- `pharos_match_status = 'pending'`
+- `pharos_booking_code = NULL` finché la prenotazione Pharos non esiste
 - `description` con fornitore, cliente, importo
 
-`cash_position` e P&L invariati. La entry resta visibile per audit/statistiche
-(query: `SELECT … FROM journal_entries WHERE source='cliente_paga_fornitore'`).
+Quando Pharos importa la prenotazione, il dashboard permette un match manuale:
+la entry passa a `pharos_match_status='matched'` e salva il `pharos_booking_code`.
+Pharos resta read-only in questa prima slice.
 
 Flow conversazionale (5 step):
 1. scegli fornitore
 2. importo
 3. fonte: cassa interna **oppure** "🧑 Cliente (paga direttamente)"
-4. (solo se Cliente) → scrivi nome e cognome del cliente
+4. (solo se Cliente) → scrivi nome e cognome del cliente; data default oggi
 5. conferma → scrittura
 
 Vedi migrazione `026_customer_paid_supplier.sql` per le modifiche allo schema
@@ -329,7 +340,7 @@ qui per riferimento veloce.
 | 95-108  | Stato preview multi-tx (`_pending_previews`) e soglie sospetto |
 | 110-200 | `SYSTEM_PROMPT` per Claude — istruzioni su quando chiamare il tool, regole tipo/currency/account_code/descrizione/confidence + esempi |
 | 200-360 | Helpers Supabase REST (`upsert_telegram_user`, `get_telegram_user`, `find_user_by_*`, `fetch_users_with_account`, `fetch_active_economic_accounts`) |
-| 380-490 | Journal entry write/rollback + dual-write Sheet       |
+| 380-490 | Journal entry RPC write + dual-write Sheet            |
 | 495-620 | Tool schema `register_transaction` (`_build_register_transaction_tool`, `init_claude_tool`) e `ask_claude` con tool use |
 | 715-755 | `_build_economic_lines` (entrata/uscita, una currency per tx) |
 | 569-720 | Multi-transaction parse, preview format, suspect heuristics |
@@ -369,13 +380,10 @@ comodamente dentro.
 con `Prefer: resolution=merge-duplicates`, così ogni messaggio aggiorna
 display_name/last_seen senza duplicare la riga.
 
-**Bilanciamento e rollback**: `insert_journal_entry` fa 3 chiamate REST
-(INSERT entries, INSERT lines, RPC check). Se il check fallisce, chiama
-`_rollback_entry` che cancella l'entry (le lines vanno via via cascade).
-**Limite noto**: tra il primo e il terzo passo non c'è una transazione
-DB vera (siamo su REST), quindi una entry sbilanciata può esistere per
-qualche ms se il processo viene killato in mezzo. La view
-`unbalanced_entries` esiste apposta per pescarle.
+**Bilanciamento atomico**: `insert_journal_entry` chiama la RPC Postgres
+`create_balanced_journal_entry`. Header, righe e controllo dare/avere per
+currency vivono nella stessa transazione DB; se qualcosa fallisce non resta
+una entry parziale da ripulire lato bot.
 
 **Prompt caching**: `ask_claude` mette il `SYSTEM_PROMPT` con
 `cache_control: ephemeral` → dopo la prima chiamata, i 5 minuti successivi

@@ -2239,6 +2239,11 @@ def _cassa_label(code: str) -> str:
     return code
 
 
+def _looks_like_new_transaction(text: str) -> bool:
+    """True when a text sent inside a flow is probably a normal +/- entry."""
+    return _count_transaction_starts(text or "") >= 1 and _looks_like_transaction_command(text or "")
+
+
 async def cmd_paga_fornitore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Entry point: /paga_fornitore — mostra tastiera fornitori.
     Ammessi: contabile, proprieta, oppure utenti con can_pay_supplier=TRUE."""
@@ -2308,7 +2313,13 @@ async def pf_on_supplier(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def pf_on_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Step 3: utente ha scritto importo → mostra tastiera casse."""
-    text = (update.message.text or "").strip().replace(",", ".")
+    raw_text = (update.message.text or "").strip()
+    if _looks_like_new_transaction(raw_text):
+        context.user_data.clear()
+        await handle_message(update, context)
+        return ConversationHandler.END
+
+    text = raw_text.replace(",", ".")
     try:
         importo = float(text)
     except ValueError:
@@ -2415,6 +2426,11 @@ async def pf_on_client_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     salviamo in user_data, mostriamo il riepilogo e chiediamo conferma.
     """
     raw = (update.message.text or "").strip()
+    if _looks_like_new_transaction(raw):
+        context.user_data.clear()
+        await handle_message(update, context)
+        return ConversationHandler.END
+
     # Validazione minima: almeno 2 caratteri non-whitespace. Non imponiamo
     # pattern strict (nomi composti, accenti, transliterazioni arabe → tutti
     # validi). Trimmiamo e collassiamo gli spazi multipli.

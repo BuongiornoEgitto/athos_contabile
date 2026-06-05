@@ -16,7 +16,9 @@ Flow:
 """
 import os
 import json
+import html
 import logging
+import traceback
 import requests
 from datetime import datetime, timedelta
 from transaction_core import (
@@ -2769,6 +2771,44 @@ async def _on_startup(application) -> None:
             print(f"[startup] set_my_commands admin {uid} skip ({e})")
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Gestore errori globale: LOGGA e AVVISA invece di restare zitto.
+
+    Senza questo, un'eccezione dentro un handler veniva inghiottita da
+    python-telegram-bot e l'utente non riceveva nulla (bot "muto").
+    """
+    logger.exception("Errore non gestito nel bot", exc_info=context.error)
+
+    # 1) Avvisa l'utente nella chat dove e' successo (best-effort).
+    try:
+        if isinstance(update, Update) and update.effective_message:
+            await update.effective_message.reply_text(
+                "❌ Qualcosa e' andato storto. Riprova; se sei dentro un flow "
+                "usa /annulla e ricomincia."
+            )
+    except Exception:
+        logger.exception("on_error: impossibile avvisare l'utente")
+
+    # 2) Manda il dettaglio tecnico a Omar (best-effort). Puo' fallire se Omar
+    #    non ha mai scritto in privato al bot — come gia' gestito dal daily report.
+    try:
+        owner_id = _fetch_proprieta_user_id()
+        if owner_id:
+            tb = "".join(
+                traceback.format_exception(
+                    type(context.error), context.error,
+                    context.error.__traceback__ if context.error else None,
+                )
+            )
+            await context.bot.send_message(
+                chat_id=owner_id,
+                text="⚠️ Errore bot:\n<pre>" + html.escape(tb[-3000:]) + "</pre>",
+                parse_mode="HTML",
+            )
+    except Exception:
+        logger.exception("on_error: impossibile avvisare Omar")
+
+
 def main():
     # Fail-fast su env vars mancanti (errore esplicito invece di crash
     # criptico al primo messaggio). Vedi validate_environment() in cima.
@@ -2786,6 +2826,8 @@ def main():
         .post_init(_on_startup)
         .build()
     )
+    # Gestore errori globale: avvisa invece di restare zitto.
+    app.add_error_handler(on_error)
     app.add_handler(CommandHandler("start", start_command))
 
     # /raccolgo — flow conversazionale (entry → optional amount → keyboard).
@@ -2800,6 +2842,7 @@ def main():
         fallbacks=[CommandHandler("annulla", racc_cancel)],
         per_user=True,
         per_chat=True,
+        allow_reentry=True,
     )
     app.add_handler(raccolgo_conv)
     app.add_handler(CallbackQueryHandler(racc_on_callback, pattern=r"^racc[:_]"))
@@ -2813,6 +2856,7 @@ def main():
         fallbacks=[CommandHandler("annulla", verso_cancel)],
         per_user=True,
         per_chat=True,
+        allow_reentry=True,
     )
     app.add_handler(verso_conv)
     app.add_handler(CallbackQueryHandler(verso_on_callback, pattern=r"^verso[:_]"))
@@ -2832,6 +2876,7 @@ def main():
         fallbacks=[CommandHandler("annulla", cambia_cancel)],
         per_user=True,
         per_chat=True,
+        allow_reentry=True,
     )
     app.add_handler(cambia_conv)
 
@@ -2855,6 +2900,9 @@ def main():
         # Per-user: ogni utente ha il suo stato indipendente
         per_user=True,
         per_chat=True,
+        # Rimandare /paga_fornitore riparte sempre il flow (niente piu "muto"
+        # se una conversazione era rimasta aperta).
+        allow_reentry=True,
     )
     app.add_handler(paga_fornitore_conv)
 

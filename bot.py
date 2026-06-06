@@ -1004,8 +1004,16 @@ async def _require_account_user(update: Update):
     tg_user = get_telegram_user(update.effective_user.id)
 
     if not tg_user or not tg_user.get("account_code"):
+        logger.warning(
+            "account command blocked: telegram_user_id=%s role=%s has_account=%s",
+            update.effective_user.id,
+            tg_user.get("role") if tg_user else None,
+            bool(tg_user and tg_user.get("account_code")),
+        )
         await update.message.reply_text(
-            "⏳ Ti ho registrato ma Omar deve ancora associarti a un conto."
+            "⏳ Ti ho registrato ma Omar deve ancora associarti a un conto.\n\n"
+            f"ID Telegram: {update.effective_user.id}\n"
+            "Quando Omar ti assegna role e account_code, riprova /raccolgo."
         )
         return None
 
@@ -1096,6 +1104,26 @@ def _extract_currency_args(args: list[str]) -> tuple[list[str], float | None, st
             cur = "EUR"
             rest = rest[1:]
     return rest, amt, (cur or "EUR")
+
+
+def _command_args(update: Update, context: ContextTypes.DEFAULT_TYPE, command_name: str) -> list[str]:
+    """Return args for slash commands and text aliases like 'raccolgo 200'.
+
+    CommandHandler fills context.args for '/raccolgo 200'. Text aliases enter
+    through MessageHandler, so we parse the first token ourselves.
+    """
+    if getattr(context, "args", None):
+        return list(context.args)
+
+    text = (update.message.text if update.message else "") or ""
+    parts = text.strip().split()
+    if not parts:
+        return []
+
+    first = parts[0].lstrip("/").split("@", 1)[0].lower()
+    if first != command_name:
+        return []
+    return parts[1:]
 
 
 def _fmt_money(amount: float, currency: str) -> str:
@@ -1216,7 +1244,7 @@ async def cmd_raccolgo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     receiver_account = tg_user["account_code"]
     receiver_name = tg_user.get("display_name") or "admin"
 
-    args = context.args
+    args = _command_args(update, context, "raccolgo")
     if len(args) == 0:
         await update.message.reply_text(
             "💰 Quanto stai raccogliendo?\n"
@@ -1433,7 +1461,7 @@ async def cmd_verso(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender_account = tg_user["account_code"]
     sender_name = tg_user.get("display_name") or "admin"
 
-    args = context.args
+    args = _command_args(update, context, "verso")
     if len(args) == 0:
         await update.message.reply_text(
             "💸 Quanto stai versando?\n"
@@ -2835,7 +2863,15 @@ def main():
     # scritto dopo "Quanto raccogli?" verrebbe intercettato da handle_message
     # e interpretato come transazione libera.
     raccolgo_conv = ConversationHandler(
-        entry_points=[CommandHandler("raccolgo", cmd_raccolgo)],
+        entry_points=[
+            CommandHandler("raccolgo", cmd_raccolgo),
+            MessageHandler(
+                filters.TEXT
+                & ~filters.COMMAND
+                & filters.Regex(r"(?i)^raccolgo(?:@\w+)?(?:\s|$)"),
+                cmd_raccolgo,
+            ),
+        ],
         states={
             RACC_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, racc_on_amount)],
         },
@@ -2849,7 +2885,15 @@ def main():
 
     # /verso — stesso pattern di /raccolgo (flow conversazionale + tastiera).
     verso_conv = ConversationHandler(
-        entry_points=[CommandHandler("verso", cmd_verso)],
+        entry_points=[
+            CommandHandler("verso", cmd_verso),
+            MessageHandler(
+                filters.TEXT
+                & ~filters.COMMAND
+                & filters.Regex(r"(?i)^verso(?:@\w+)?(?:\s|$)"),
+                cmd_verso,
+            ),
+        ],
         states={
             VERSO_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, verso_on_amount)],
         },
